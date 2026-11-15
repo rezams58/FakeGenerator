@@ -1,0 +1,191 @@
+using Confluent.Kafka;
+using FakeOrderGenerator.Configuration;
+using FakeOrderGenerator.Data;
+using FakeOrderGenerator.Kafka;
+using Microsoft.Extensions.Options;
+
+namespace FakeOrderGenerator.Workers;
+
+public sealed class KafkaPublisherWorker : BackgroundService
+{
+    private readonly KafkaSettings _kafkaSetting;
+    private readonly PublisherConfig _publisherSetting;
+    private readonly SqlOrderRepository _repository;
+    private readonly ILogger<KafkaPublisherWorker> _logger;
+    private readonly Guid _ownerId = Guid.NewGuid();
+    private readonly int _batchSize, _idleDelay, _retryDelay, _maxRetryCount;
+    private readonly int _leaseSeconds, _renewSeconds, _maxPartitions;
+    private readonly bool _enabled;
+
+    public KafkaPublisherWorker(SqlOrderRepository repository,
+                                IOptions<KafkaSettings> kafkaOption,
+                                IOptions<PublisherConfig> PublisherOption,
+                                ILogger<KafkaPublisherWorker> logger)
+    {
+        _repository = repository;
+        _publisherSetting = PublisherOption.Value;
+        _logger = logger;
+        _kafkaSetting = kafkaOption.Value;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (!_enabled) return;
+        // Fail fast before any message is read or sent. Extra partitions are allowed; only 0..N-1 are used.
+        KafkaTopicValidator.Validate(_kafkaSetting.BootstrapServers, _kafkaSetting.Topic, _kafkaSetting.PartitionCount);
+        await _repository.ValidateLeasePartitionsAsync(_kafkaSetting.PartitionCount, stoppingToken);
+        _logger.LogInformation("Publisher {OwnerId} started for topic {Topic}; expected partitions={Count}",
+                                _ownerId, _kafkaSetting.Topic, _kafkaSetting.PartitionCount);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var leases = await _repository.ClaimPartitionsAsync(_ownerId, _maxPartitions, _leaseSeconds, stoppingToken);
+            if (leases.Count == 0)
+            {
+                await Task.Delay(Math.Max(_idleDelay, 500), stoppingToken);
+                continue;
+            }
+
+            var tasks = leases.Select(lease => RunPartitionLoopAsync(lease, stoppingToken)).ToArray();
+            await Task.WhenAll(tasks);
+        }
+    }
+
+
+    private async Task RunPartitionLoopAsync(PartitionLease initialLease, CancellationToken stoppingToken)
+    {
+        PartitionLease? lease = initialLease;
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            if (lease is null)
+            {
+                var next = await _repository.ClaimPartitionsAsync(_ownerId, 1, _leaseSeconds, stoppingToken);
+                if (next.Count == 0)
+                {
+                    await Task.Delay(Math.Max(_idleDelay, 500), stoppingToken);
+                    continue;
+                }
+                lease = next[0];
+            }
+
+            await RunPartitionAsync(lease, stoppingToken);
+            lease = null;
+            if (!stoppingToken.IsCancellationRequested)
+                await Task.Delay(500, stoppingToken);
+        }
+    }
+
+    private async Task RunPartitionAsync(PartitionLease lease, CancellationToken stoppingToken)
+    {
+        using var laneCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var heartbeat = RenewLeaseLoopAsync(lease, laneCts);
+        try
+        {
+            // InitTransactions uses a stable transactional.id per topic/partition. A takeover fences the old producer.
+            using var publisher = new PartitionedKafkaPublisher(_kafkaSetting, lease.PartitionId);
+            _logger.LogInformation("Acquired partition {Partition} with fencing token {Token}",
+                lease.PartitionId, lease.FencingToken);
+
+            while (!laneCts.IsCancellationRequested)
+            {
+                var batch = await _repository.ReadPendingAsync(lease, _batchSize,
+                    _maxRetryCount, laneCts.Token);
+                if (batch.Count == 0)
+                {
+                    await Task.Delay(_idleDelay, laneCts.Token);
+                    continue;
+                }
+
+                try
+                {
+                    await publisher.PublishBatchAsync(batch, laneCts.Token);
+                }
+                catch (OperationCanceledException) when (laneCts.IsCancellationRequested) { break; }
+                catch (KafkaPublishBatchException ex)
+                {
+                    // The failed batch transaction was aborted. Re-publish only its successful prefix in a
+                    // fresh transaction so a later poison event never causes an earlier event to be dead-lettered.
+                    var prefix = batch.TakeWhile(x => x.SequenceNo < ex.FailedMessage.SequenceNo).ToList();
+                    if (prefix.Count > 0)
+                    {
+                        await publisher.PublishBatchAsync(prefix, laneCts.Token);
+                        int prefixUpdated = await _repository.MarkPublishedAsync(prefix.Select(x => x.EventId), lease, laneCts.Token);
+                        if (prefixUpdated != prefix.Count)
+                            throw new InvalidOperationException("Lease lost while marking the successfully replayed prefix.");
+                    }
+
+                    bool recorded = await _repository.MarkFailedAsync(ex.FailedMessage, lease, ex.InnerException?.Message ?? ex.Message,
+                        _maxRetryCount, stoppingToken);
+                    _logger.LogError(ex,
+                        "Partition {Partition} blocked at Sequence {Sequence}; failure recorded={Recorded}",
+                        lease.PartitionId, ex.FailedMessage.SequenceNo, recorded);
+                    if (!recorded) break;
+                    await Task.Delay(_retryDelay, laneCts.Token);
+                    continue;
+                }
+
+                // Keep this outside the Kafka-send catch: Kafka may already have committed. A SQL failure here
+                // must cause replay/deduplication, not incorrectly increment RetryCount for an acknowledged event.
+                int updated = await _repository.MarkPublishedAsync(batch.Select(x => x.EventId), lease, laneCts.Token);
+                if (updated != batch.Count)
+                    throw new InvalidOperationException($"Lease lost or outbox state changed while marking partition {lease.PartitionId}; expected {batch.Count}, updated {updated}. Kafka transaction was committed; replay is possible and consumers must deduplicate EventId.");
+                _logger.LogInformation("Partition {Partition}: transaction committed and {Count} rows marked published; last sequence {Sequence}",
+                    lease.PartitionId, updated, batch[^1].SequenceNo);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested || laneCts.IsCancellationRequested)
+        {
+            // Normal shutdown or lease loss.
+        }
+        catch (KafkaException ex)
+        {
+            _logger.LogError(ex, "Kafka producer for partition {Partition} failed/fenced; lane will release its lease", lease.PartitionId);
+        }
+        catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "Partition {Partition} lane stopped unexpectedly. Unconfirmed Kafka outcomes will be replayed and deduplicated by EventId.", lease.PartitionId);
+        }
+        finally
+        {
+            laneCts.Cancel();
+            try { await heartbeat; } catch (OperationCanceledException) { }
+            try { await _repository.ReleaseLeaseAsync(lease, CancellationToken.None); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Could not release lease for partition {Partition}; it will expire", lease.PartitionId); }
+        }
+    }
+
+    private async Task RenewLeaseLoopAsync(PartitionLease lease, CancellationTokenSource laneCts)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(_renewSeconds));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(laneCts.Token))
+            {
+                if (!await _repository.RenewLeaseAsync(lease, _leaseSeconds, laneCts.Token))
+                {
+                    _logger.LogCritical("Lost lease for partition {Partition} (fencing token {Token}); stopping this producer immediately",
+                        lease.PartitionId, lease.FencingToken);
+                    laneCts.Cancel();
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (laneCts.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            _logger.LogCritical(ex, "Lease heartbeat failed for partition {Partition}; stopping its producer lane", lease.PartitionId);
+            laneCts.Cancel();
+        }
+    }
+
+    public override bool Equals(object? obj)
+    {
+        return obj is KafkaPublisherWorker worker &&
+               EqualityComparer<KafkaSettings>.Default.Equals(_kafkaSetting, worker._kafkaSetting);
+    }
+
+    public override int GetHashCode()
+    {
+        return HashCode.Combine(_kafkaSetting);
+    }
+}
