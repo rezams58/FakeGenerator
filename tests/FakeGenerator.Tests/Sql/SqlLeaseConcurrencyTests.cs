@@ -3,17 +3,17 @@ using FakeOrderGenerator.Data;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
 
-namespace FakeGenerator.Tests;
+namespace FakeGenerator.Tests.Sql;
 
+[Collection("SqlLease")]
 public sealed class SqlLeaseConcurrencyTests
 {
-    [Fact]
+    [SqlFact]
     public async Task Concurrent_claims_do_not_assign_the_same_partition_to_two_owners_and_stale_token_cannot_renew()
     {
         // Set FAKEGEN_TEST_SQL to a disposable database after applying sql/01-schema.sql and
         // sql/03-multinstance-publisher.sql. The test deliberately does not create/drop schema.
-        string? connectionString = Environment.GetEnvironmentVariable("FAKEGEN_TEST_SQL");
-        if (string.IsNullOrWhiteSpace(connectionString)) return;
+        string connectionString = TestEnv.Sql!;
 
         var repository = new SqlOrderRepository(Options.Create(new ConnectionSettings { SqlServer = connectionString }));
         Guid ownerA = Guid.NewGuid(), ownerB = Guid.NewGuid();

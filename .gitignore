@@ -3,3 +3,8 @@ obj/
 .vs/
 *.user
 *.suo
+
+reports/
+
+# Local integration-test settings (may contain passwords)
+local.env

@@ -1,6 +1,6 @@
 using FakeOrderGenerator.Data;
 
-namespace FakeGenerator.Tests;
+namespace FakeGenerator.Tests.Unit;
 
 public sealed class PartitioningTests
 {
