@@ -8,3 +8,9 @@ reports/
 
 # Local integration-test settings (may contain passwords)
 local.env
+
+# Local test output and crash diagnostics
+*.log
+TestResults/
+*.trx
+*.dmp
