@@ -184,11 +184,29 @@ public sealed class SqlOrderRepository : IOutboxRepository
 
     public async Task<List<OutboxMessage>> ReadPendingAsync(PartitionLease lease, int batchSize, int maxRetryCount, CancellationToken ct)
     {
+        // Take the shared table lock before scanning so concurrent multi-partition inserts
+        // cannot become visible partway through the scan. A single table lock also avoids
+        // deadlocks between a writer and readers holding different partition ranges.
         const string sql = """
-            SELECT TOP (@BatchSize) EventId, SequenceNo, AggregateKey, KafkaPartition, EventType, Payload
+            -- A lower retry limit after restart must finalize exhausted rows, not hide them.
+            -- This fenced update preserves the original failure details and retry count.
+            UPDATE o
+            SET DeadLetterAtUtc = SYSUTCDATETIME(),
+                LastError = COALESCE(o.LastError, N'Retry limit reached after configuration change.')
             FROM dbo.Outbox o
             WHERE o.PublishedAtUtc IS NULL AND o.DeadLetterAtUtc IS NULL
-              AND o.RetryCount < @MaxRetryCount AND o.KafkaPartition = @PartitionId
+              AND o.RetryCount >= @MaxRetryCount AND o.KafkaPartition = @PartitionId
+              AND EXISTS
+              (
+                  SELECT 1 FROM dbo.PublisherPartitionLease l
+                  WHERE l.PartitionId = @PartitionId AND l.OwnerId = @OwnerId
+                    AND l.FencingToken = @FencingToken AND l.LeaseUntilUtc > SYSUTCDATETIME()
+              );
+
+            SELECT TOP (@BatchSize) EventId, SequenceNo, AggregateKey, KafkaPartition, EventType, Payload
+            FROM dbo.Outbox o WITH (TABLOCK, HOLDLOCK, INDEX(IX_Outbox_PendingPartitionSequence))
+            WHERE o.PublishedAtUtc IS NULL AND o.DeadLetterAtUtc IS NULL
+              AND o.KafkaPartition = @PartitionId
               AND EXISTS
               (
                   SELECT 1 FROM dbo.PublisherPartitionLease l

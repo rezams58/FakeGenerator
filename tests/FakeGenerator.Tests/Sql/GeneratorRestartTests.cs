@@ -8,6 +8,7 @@ using System.Text.Json;
 
 namespace FakeGenerator.Tests.Sql;
 
+[Collection("SqlLease")]
 public sealed class GeneratorRestartTests
 {
     [SqlFact]
@@ -38,7 +39,13 @@ public sealed class GeneratorRestartTests
         // Run 1: stop mid-run.
         var first = NewWorker(42);
         await first.StartAsync(cts.Token);
-        while (await repo.CountOutboxAsync(cts.Token) < start + 120) await Task.Delay(20, cts.Token);
+        while (await repo.CountOutboxAsync(cts.Token) < start + 120)
+        {
+            // Surface a failed background worker instead of polling until the test hangs.
+            if (first.ExecuteTask!.IsCompleted) await first.ExecuteTask;
+            Assert.False(first.ExecuteTask.IsCompleted, "Generator stopped before producing the first batches.");
+            await Task.Delay(20, cts.Token);
+        }
         await first.StopAsync(CancellationToken.None);
         long afterFirst = await repo.CountOutboxAsync(cts.Token);
         long maxAfterFirst = await repo.GetMaxSequenceAsync(cts.Token);

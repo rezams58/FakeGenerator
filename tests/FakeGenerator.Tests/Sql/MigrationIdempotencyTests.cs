@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 
 namespace FakeGenerator.Tests.Sql;
 
+[Collection("SqlLease")]
 public sealed class MigrationIdempotencyTests
 {
     [SqlFact]

@@ -1,10 +1,43 @@
 using FakeOrderGenerator.Kafka;
+using FakeOrderGenerator.Configuration;
+using FakeOrderGenerator.Workers;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using static FakeGenerator.Tests.Unit.WorkerHarness;
 
 namespace FakeGenerator.Tests.Unit;
 
 public sealed class PublisherWorkerTests
 {
+    [Fact]
+    public async Task Spare_capacity_claims_newly_expired_partitions_without_exceeding_the_cap()
+    {
+        var repo = new FakeOutboxRepository();
+        repo.EnqueueLease(Lease(0));
+        var factory = new FakePublisherFactory(new FakePublisher());
+        var options = new PublisherConfig
+        {
+            MaxPartitionsPerInstance = 2, IdleDelayMilliseconds = 10,
+            LeaseDurationSeconds = 30, LeaseRenewIntervalSeconds = 5
+        };
+        using var worker = new KafkaPublisherWorker(repo, factory, new FakeTopicValidator(),
+            Options.Create(new KafkaSettings()), Options.Create(options), NullLogger<KafkaPublisherWorker>.Instance);
+        await worker.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => factory.CreatedPartitions.Count == 1);
+            repo.EnqueueLease(Lease(1)); // Another owner has now expired, while lane 0 remains healthy.
+            await WaitUntilAsync(() => factory.CreatedPartitions.Count == 2, 3000);
+            repo.EnqueueLease(Lease(2));
+            await Task.Delay(700);
+        }
+        finally { await worker.StopAsync(CancellationToken.None); }
+
+        Assert.Equal([0, 1], factory.CreatedPartitions);
+        Assert.Equal(2, repo.ClaimLimits[0]);
+        Assert.All(repo.ClaimLimits.Skip(1), capacity => Assert.Equal(1, capacity));
+    }
+
     private static async Task RunUntilAsync(Func<Task> start, Func<bool> done, Func<Task> stop)
     {
         await start();

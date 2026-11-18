@@ -39,7 +39,12 @@ internal sealed class FakePublisher : IPartitionPublisher
 
 internal sealed class FakePublisherFactory(FakePublisher publisher) : IPartitionPublisherFactory
 {
-    public IPartitionPublisher Create(int partitionId) => publisher;
+    public List<int> CreatedPartitions { get; } = [];
+    public IPartitionPublisher Create(int partitionId)
+    {
+        lock (CreatedPartitions) CreatedPartitions.Add(partitionId);
+        return publisher;
+    }
 }
 
 internal sealed class FakeOutboxRepository : IOutboxRepository
@@ -55,6 +60,12 @@ internal sealed class FakeOutboxRepository : IOutboxRepository
     public List<PartitionLease> Released { get; } = [];
     public int RenewCalls { get; private set; }
     public DateTime? RenewFailedAtUtc { get; private set; }
+    public List<int> ClaimLimits { get; } = [];
+
+    public void EnqueueLease(PartitionLease lease)
+    {
+        lock (_gate) LeasesToHand.Add(lease);
+    }
 
     public Task EnsureLeasePartitionsAsync(int partitionCount, CancellationToken ct) => Task.CompletedTask;
     public Task ValidateLeasePartitionsAsync(int partitionCount, CancellationToken ct) => Task.CompletedTask;
@@ -63,6 +74,7 @@ internal sealed class FakeOutboxRepository : IOutboxRepository
     {
         lock (_gate)
         {
+            ClaimLimits.Add(maxPartitions);
             var result = LeasesToHand.Take(maxPartitions).Select(l => l with { OwnerId = ownerId }).ToList();
             LeasesToHand.RemoveRange(0, result.Count);
             return Task.FromResult<IReadOnlyList<PartitionLease>>(result);
