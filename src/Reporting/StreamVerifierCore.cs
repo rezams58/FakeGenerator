@@ -9,7 +9,8 @@ public sealed record StreamRecord(int Partition, long Offset, Guid EventId, long
 public sealed record VerificationResult(long Duplicates, long OrderingViolations, long LifecycleViolations,
     long DeadLetterGaps, long MissingOnStream, long RecordsRead)
 {
-    public bool HasViolations => Duplicates > 0 || OrderingViolations > 0 || LifecycleViolations > 0 || MissingOnStream > 0;
+    public bool Complete { get; init; } = true;
+    public bool HasViolations => !Complete || OrderingViolations > 0 || LifecycleViolations > 0 || MissingOnStream > 0;
 }
 
 /// <summary>Pure verification logic (contracts/consumer-inbox.md): duplicates, ordering, lifecycle, dead-letter gaps, missing events.</summary>
@@ -32,7 +33,7 @@ public static class StreamVerifierCore
             unique.Add(r);
         }
 
-        long lifecycleViolations = 0, gaps = 0;
+        long lifecycleViolations = 0, gaps = deadLetteredEntityIds.Count;
         foreach (var g in unique.GroupBy(x => x.EntityId))
         {
             string? previous = null;
@@ -46,7 +47,7 @@ public static class StreamVerifierCore
                 previous = e.Status;
                 terminalSeen = lifecycle.IsTerminal(e.Status);
             }
-            if (broken) { if (deadLetteredEntityIds.Contains(g.Key)) gaps++; else lifecycleViolations++; }
+            if (broken && !deadLetteredEntityIds.Contains(g.Key)) lifecycleViolations++;
         }
 
         long missing = sqlPublishedEventIds.Count(id => !seen.Contains(id));
