@@ -1,4 +1,5 @@
 using FakeOrderGenerator.Configuration;
+using FakeOrderGenerator.Generation;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
 using System.Data;
@@ -8,7 +9,7 @@ namespace FakeOrderGenerator.Data;
 
 public sealed record PartitionLease(int PartitionId, Guid OwnerId, long FencingToken, DateTime LeaseUntilUtc);
 
-public sealed class SqlOrderRepository
+public sealed class SqlOrderRepository : IOutboxRepository
 {
     private readonly string _connectionString;
 
@@ -23,51 +24,46 @@ public sealed class SqlOrderRepository
         return Convert.ToInt64(await cmd.ExecuteScalarAsync(ct));
     }
 
-    public async Task InsertOrdersAsync(IReadOnlyList<Order> orders, int partitionCount, CancellationToken ct)
+    public async Task<long> CountOutboxAsync(CancellationToken ct)
     {
-        if (orders.Count == 0) return;
+        await using var cn = new SqlConnection(_connectionString);
+        await cn.OpenAsync(ct);
+        await using var cmd = new SqlCommand("SELECT COUNT_BIG(*) FROM dbo.Outbox;", cn);
+        return Convert.ToInt64(await cmd.ExecuteScalarAsync(ct));
+    }
 
-        var rows = orders.Select(o => new
+    /// <summary>
+    /// Writes the entity changes and their Outbox rows in ONE transaction (FR-002): either both commit or both roll back.
+    /// </summary>
+    public async Task WriteBatchAsync(IEntityWriter writer, EventBatch batch, CancellationToken ct)
+    {
+        if (batch.Events.Count == 0) return;
+
+        var rows = batch.Events.Select(e => new
         {
-            o.OrderId, o.SequenceNo, o.OrderNumber, o.CustomerId, o.Amount, o.CreatedAtUtc,
-            EventId = Guid.NewGuid(),
-            KafkaPartition = Partitioning.GetPartition(o.CustomerId, partitionCount),
-            EventType = "OrderCreated",
-            Payload = JsonSerializer.Serialize(o)
-        }).ToList();
-
+            e.EventId, e.SequenceNo, e.AggregateKey, e.KafkaPartition, e.EventType, e.Payload,
+            CreatedAtUtc = e.CreatedAtUtc.ToString("yyyy-MM-ddTHH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture)
+        });
         string json = JsonSerializer.Serialize(rows);
+
         await using var cn = new SqlConnection(_connectionString);
         await cn.OpenAsync(ct);
         await using var tx = (SqlTransaction)await cn.BeginTransactionAsync(ct);
         try
         {
-            const string insertOrders = """
-                INSERT INTO dbo.Orders (OrderId, SequenceNo, OrderNumber, CustomerId, Amount, CreatedAtUtc)
-                SELECT OrderId, SequenceNo, OrderNumber, CustomerId, Amount, CreatedAtUtc
-                FROM OPENJSON(@json) WITH
-                (
-                    OrderId UNIQUEIDENTIFIER '$.OrderId', SequenceNo BIGINT '$.SequenceNo',
-                    OrderNumber NVARCHAR(40) '$.OrderNumber', CustomerId NVARCHAR(40) '$.CustomerId',
-                    Amount DECIMAL(18,2) '$.Amount', CreatedAtUtc DATETIME2 '$.CreatedAtUtc'
-                );
-                """;
-            await using (var cmd = new SqlCommand(insertOrders, cn, tx))
-            {
-                cmd.Parameters.Add("@json", SqlDbType.NVarChar, -1).Value = json;
-                await cmd.ExecuteNonQueryAsync(ct);
-            }
+            await writer.InsertNewAsync(tx, batch.NewEntities, ct);
+            await writer.ApplyTransitionAsync(tx, batch.Transitioned, ct);
 
             const string insertOutbox = """
                 INSERT INTO dbo.Outbox
                     (EventId, SequenceNo, AggregateKey, KafkaPartition, EventType, Payload, CreatedAtUtc)
-                SELECT EventId, SequenceNo, CustomerId, KafkaPartition, EventType, Payload, CreatedAtUtc
+                SELECT EventId, SequenceNo, AggregateKey, KafkaPartition, EventType, Payload, CreatedAtUtc
                 FROM OPENJSON(@json) WITH
                 (
                     EventId UNIQUEIDENTIFIER '$.EventId', SequenceNo BIGINT '$.SequenceNo',
-                    CustomerId NVARCHAR(40) '$.CustomerId', KafkaPartition INT '$.KafkaPartition',
+                    AggregateKey NVARCHAR(40) '$.AggregateKey', KafkaPartition INT '$.KafkaPartition',
                     EventType NVARCHAR(100) '$.EventType', Payload NVARCHAR(MAX) '$.Payload',
-                    CreatedAtUtc DATETIME2 '$.CreatedAtUtc'
+                    CreatedAtUtc DATETIME2(3) '$.CreatedAtUtc'
                 );
                 """;
             await using (var cmd = new SqlCommand(insertOutbox, cn, tx))
@@ -82,6 +78,27 @@ public sealed class SqlOrderRepository
             await tx.RollbackAsync(CancellationToken.None);
             throw;
         }
+    }
+
+    /// <summary>Idempotently inserts lease rows for PartitionId 0..partitionCount-1 (research R6).</summary>
+    public async Task EnsureLeasePartitionsAsync(int partitionCount, CancellationToken ct)
+    {
+        const string sql = """
+            ;WITH ids AS
+            (
+                SELECT TOP (@PartitionCount) CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1 AS INT) AS PartitionId
+                FROM sys.all_objects
+            )
+            INSERT INTO dbo.PublisherPartitionLease (PartitionId, OwnerId, LeaseUntilUtc, FencingToken)
+            SELECT i.PartitionId, NULL, '2000-01-01T00:00:00', 0
+            FROM ids i
+            WHERE NOT EXISTS (SELECT 1 FROM dbo.PublisherPartitionLease l WHERE l.PartitionId = i.PartitionId);
+            """;
+        await using var cn = new SqlConnection(_connectionString);
+        await cn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, cn);
+        cmd.Parameters.Add("@PartitionCount", SqlDbType.Int).Value = partitionCount;
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     public async Task ValidateLeasePartitionsAsync(int partitionCount, CancellationToken ct)

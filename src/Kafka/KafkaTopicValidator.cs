@@ -18,3 +18,15 @@ public static class KafkaTopicValidator
             throw new InvalidOperationException($"Kafka topic '{topic}' has {topicMetadata.Partitions.Count} partitions; at least {minimumPartitions} are required. Increase the topic partition count before starting the publisher.");
     }
 }
+
+/// <summary>Seam so the publisher worker can be unit-tested without a broker.</summary>
+public interface ITopicValidator
+{
+    void Validate(string bootstrapServers, string topic, int minimumPartitions);
+}
+
+public sealed class KafkaTopicValidatorAdapter : ITopicValidator
+{
+    public void Validate(string bootstrapServers, string topic, int minimumPartitions) =>
+        KafkaTopicValidator.Validate(bootstrapServers, topic, minimumPartitions);
+}

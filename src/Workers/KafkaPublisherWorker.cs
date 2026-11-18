@@ -2,6 +2,7 @@ using Confluent.Kafka;
 using FakeOrderGenerator.Configuration;
 using FakeOrderGenerator.Data;
 using FakeOrderGenerator.Kafka;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
 
 namespace FakeOrderGenerator.Workers;
@@ -10,29 +11,45 @@ public sealed class KafkaPublisherWorker : BackgroundService
 {
     private readonly KafkaSettings _kafkaSetting;
     private readonly PublisherConfig _publisherSetting;
-    private readonly SqlOrderRepository _repository;
+    private readonly IOutboxRepository _repository;
+    private readonly IPartitionPublisherFactory _publisherFactory;
+    private readonly ITopicValidator _topicValidator;
     private readonly ILogger<KafkaPublisherWorker> _logger;
     private readonly Guid _ownerId = Guid.NewGuid();
     private readonly int _batchSize, _idleDelay, _retryDelay, _maxRetryCount;
     private readonly int _leaseSeconds, _renewSeconds, _maxPartitions;
     private readonly bool _enabled;
 
-    public KafkaPublisherWorker(SqlOrderRepository repository,
+    public KafkaPublisherWorker(IOutboxRepository repository,
+                                IPartitionPublisherFactory publisherFactory,
+                                ITopicValidator topicValidator,
                                 IOptions<KafkaSettings> kafkaOption,
                                 IOptions<PublisherConfig> PublisherOption,
                                 ILogger<KafkaPublisherWorker> logger)
     {
         _repository = repository;
+        _publisherFactory = publisherFactory;
+        _topicValidator = topicValidator;
         _publisherSetting = PublisherOption.Value;
         _logger = logger;
         _kafkaSetting = kafkaOption.Value;
+        _enabled = _publisherSetting.Enabled;
+        _batchSize = _publisherSetting.BatchSize;
+        _idleDelay = _publisherSetting.IdleDelayMilliseconds;
+        _retryDelay = _publisherSetting.RetryDelayMilliseconds;
+        _maxRetryCount = _publisherSetting.MaxRetryCount;
+        _leaseSeconds = _publisherSetting.LeaseDurationSeconds;
+        _renewSeconds = _publisherSetting.LeaseRenewIntervalSeconds;
+        _maxPartitions = _publisherSetting.MaxPartitionsPerInstance;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (!_enabled) return;
         // Fail fast before any message is read or sent. Extra partitions are allowed; only 0..N-1 are used.
-        KafkaTopicValidator.Validate(_kafkaSetting.BootstrapServers, _kafkaSetting.Topic, _kafkaSetting.PartitionCount);
+        // A validation failure propagates: the host stops and no message is read or sent.
+        _topicValidator.Validate(_kafkaSetting.BootstrapServers, _kafkaSetting.Topic, _kafkaSetting.PartitionCount);
+        await _repository.EnsureLeasePartitionsAsync(_kafkaSetting.PartitionCount, stoppingToken);
         await _repository.ValidateLeasePartitionsAsync(_kafkaSetting.PartitionCount, stoppingToken);
         _logger.LogInformation("Publisher {OwnerId} started for topic {Topic}; expected partitions={Count}",
                                 _ownerId, _kafkaSetting.Topic, _kafkaSetting.PartitionCount);
@@ -82,7 +99,7 @@ public sealed class KafkaPublisherWorker : BackgroundService
         try
         {
             // InitTransactions uses a stable transactional.id per topic/partition. A takeover fences the old producer.
-            using var publisher = new PartitionedKafkaPublisher(_kafkaSetting, lease.PartitionId);
+            using var publisher = _publisherFactory.Create(lease.PartitionId);
             _logger.LogInformation("Acquired partition {Partition} with fencing token {Token}",
                 lease.PartitionId, lease.FencingToken);
 
@@ -114,10 +131,10 @@ public sealed class KafkaPublisherWorker : BackgroundService
                             throw new InvalidOperationException("Lease lost while marking the successfully replayed prefix.");
                     }
 
-                    bool recorded = await _repository.MarkFailedAsync(ex.FailedMessage, lease, ex.InnerException?.Message ?? ex.Message,
+                    bool recorded = await _repository.MarkFailedAsync(ex.FailedMessage, lease, RetryPolicy.FormatError(ex),
                         _maxRetryCount, stoppingToken);
                     _logger.LogError(ex,
-                        "Partition {Partition} blocked at Sequence {Sequence}; failure recorded={Recorded}",
+                        "Kafka delivery failed: partition {Partition} blocked at Sequence {Sequence}; failure recorded={Recorded}",
                         lease.PartitionId, ex.FailedMessage.SequenceNo, recorded);
                     if (!recorded) break;
                     await Task.Delay(_retryDelay, laneCts.Token);
@@ -139,7 +156,11 @@ public sealed class KafkaPublisherWorker : BackgroundService
         }
         catch (KafkaException ex)
         {
-            _logger.LogError(ex, "Kafka producer for partition {Partition} failed/fenced; lane will release its lease", lease.PartitionId);
+            _logger.LogError(ex, "Kafka error: producer for partition {Partition} failed/fenced; lane will release its lease", lease.PartitionId);
+        }
+        catch (SqlException ex)
+        {
+            _logger.LogError(ex, "SQL error: partition {Partition} lane stopped. If a Kafka commit preceded it, the batch is replayed and consumers deduplicate EventId.", lease.PartitionId);
         }
         catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
         {
@@ -176,16 +197,5 @@ public sealed class KafkaPublisherWorker : BackgroundService
             _logger.LogCritical(ex, "Lease heartbeat failed for partition {Partition}; stopping its producer lane", lease.PartitionId);
             laneCts.Cancel();
         }
-    }
-
-    public override bool Equals(object? obj)
-    {
-        return obj is KafkaPublisherWorker worker &&
-               EqualityComparer<KafkaSettings>.Default.Equals(_kafkaSetting, worker._kafkaSetting);
-    }
-
-    public override int GetHashCode()
-    {
-        return HashCode.Combine(_kafkaSetting);
     }
 }

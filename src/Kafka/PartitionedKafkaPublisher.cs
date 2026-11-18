@@ -14,7 +14,7 @@ public sealed class KafkaPublishBatchException : Exception
 }
 
 /// <summary>One transactional producer per owned partition. The stable transactional.id fences a stale owner in Kafka.</summary>
-public sealed class PartitionedKafkaPublisher : IDisposable
+public sealed class PartitionedKafkaPublisher : IPartitionPublisher
 {
     private readonly IProducer<string, string> _producer;
     private readonly string _topic;
@@ -26,7 +26,7 @@ public sealed class PartitionedKafkaPublisher : IDisposable
         {
             BootstrapServers = settings.BootstrapServers,
             ClientId = $"{settings.ClientId}-p{partitionId}",
-            TransactionalId = $"{settings.ClientId}-{settings.Topic}-partition-{partitionId}",
+            TransactionalId = TransactionalIdFor(settings, partitionId),
             Acks = Acks.All,
             EnableIdempotence = true,
             CompressionType = Enum.Parse<CompressionType>(settings.CompressionType, true),
@@ -36,6 +36,21 @@ public sealed class PartitionedKafkaPublisher : IDisposable
         };
         _producer = new ProducerBuilder<string, string>(config).Build();
         _producer.InitTransactions(TimeSpan.FromSeconds(30));
+    }
+
+    /// <summary>Stable per topic/partition so a new owner fences the old producer in Kafka (Constitution II).</summary>
+    public static string TransactionalIdFor(KafkaSettings settings, int partitionId) =>
+        $"{settings.ClientId}-{settings.Topic}-partition-{partitionId}";
+
+    /// <summary>
+    /// Index of the delivery that actually failed: the first faulted/canceled task in send order.
+    /// Earlier successful deliveries are never charged. Returns 0 when none is marked faulted.
+    /// </summary>
+    public static int FindFailedIndex(IReadOnlyList<Task> deliveries)
+    {
+        for (int i = 0; i < deliveries.Count; i++)
+            if (deliveries[i].IsFaulted || deliveries[i].IsCanceled) return i;
+        return 0;
     }
 
     public async Task PublishBatchAsync(IReadOnlyList<OutboxMessage> items, CancellationToken ct)
@@ -80,8 +95,7 @@ public sealed class PartitionedKafkaPublisher : IDisposable
             catch (Exception ex)
             {
                 if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
-                int failedIndex = deliveries.FindIndex(t => t.IsFaulted || t.IsCanceled);
-                if (failedIndex < 0) failedIndex = 0;
+                int failedIndex = FindFailedIndex(deliveries);
                 var failed = ordered[failedIndex];
                 throw new KafkaPublishBatchException(failed, ex);
             }
