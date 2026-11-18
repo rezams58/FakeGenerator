@@ -35,7 +35,10 @@ Set `ConnectionStrings:SqlServer`, `Kafka:BootstrapServers`, and `Kafka:Topic` i
 
 Important settings:
 
-- `Generator:RecordCount`: total generated count (default in this project: 500,000)
+- `Generator:TargetEventCount`: total number of **events** to generate (default 500,000). `Generator:RecordCount` is obsolete and ignored with a warning.
+- `Generator:MaxActiveEntities`, `Generator:AdvanceProbability`, `Generator:RandomSeed`: size of the active order pool, chance that a slot advances an existing order instead of creating one, optional seed for repeatable runs
+- `Generator:Entities:Order:PartitionKey` and `Generator:Entities:Order:Lifecycle`: partition key field and an explicit lifecycle graph (states, terminal states, weighted transitions). The graph must be acyclic; an invalid graph stops startup
+- `Reporting:Directory`, `Reporting:Environment`, `Reporting:RegressionThresholdPercent`: where reports and the per-environment baseline are written, and the allowed throughput regression (default 20%)
 - `Kafka:PartitionCount`: six in the current schema/migration
 - `Publisher:BatchSize`: maximum Outbox rows per Kafka transaction
 - `Publisher:MaxRetryCount`: after this many delivery failures, the blocking event is moved to the terminal dead-letter state (`DeadLetterAtUtc`) and later events in that partition may proceed
@@ -76,6 +79,35 @@ CREATE TABLE dbo.ConsumerInbox
     ProcessedAtUtc DATETIME2(3) NOT NULL CONSTRAINT DF_ConsumerInbox_ProcessedAtUtc DEFAULT SYSUTCDATETIME()
 );
 ```
+
+## Lifecycle, delivery semantics and consumers
+
+- Orders move Created -> Paid -> Shipped -> Delivered; Cancelled is possible only from Created or Paid. Every transition is one Outbox event, written in the same SQL transaction as the order change.
+- Delivery is **at-least-once**. Kafka commits before the SQL mark, so a crash in between replays the batch with the same `event-id`. Consumers must deduplicate by `event-id` with an Inbox table (see `specs/001-fake-data-kafka-publishing/contracts/consumer-inbox.md`; reference code in `tests/FakeGenerator.Tests/Kafka/InboxConsumer.cs`).
+- `Kafka:PartitionCount` must not change after events exist (it defines the partition of every key).
+- Only **one generator instance** may run at a time (it allocates `SequenceNo` from `MAX(Outbox.SequenceNo)`).
+- All publisher instances must share the same bootstrap servers, topic, partition count and `Kafka:ClientId`. Different values are unsupported (the transactional id depends on them).
+
+## Verify and run report (`--verify`)
+
+After a generate + publish run:
+
+```bash
+dotnet run --project src -- --verify
+```
+
+It reads the whole topic with a `read_committed` consumer, checks duplicates, per-partition `sequence-no` order, per-order lifecycle paths, dead-letter gaps and events missing on the stream (compared with SQL), then writes `reports/run-{utc}.json` and compares throughput with `reports/baseline.{Environment}.json` (created on the first full run). Exit code is non-zero on any violation or regression above the threshold.
+
+## Adding a new entity
+
+A new fake entity type needs only these four steps. The generator pipeline (`src/Generation/EventBatchBuilder.cs`, `src/Workers/`) is not changed.
+
+1. **Definition**: implement `IFakeEntityDefinition` in `src/Generation/<Entity>/` (name, `LifecycleDefinition`, partition key fields, `CreateNew`, `BuildPayload`).
+2. **Writer**: implement `IEntityWriter` in the same folder (insert, apply transition, load active entities for restart).
+3. **Migration**: add an idempotent `src/sql/NN-<entity>.sql` creating the entity table with `Status`, `LastEventSequenceNo`, `UpdatedAtUtc`.
+4. **Config**: add an `Generator:Entities:<Entity>` entry in `appsettings.json` (`PartitionKey`, optional explicit `Lifecycle`) and register the definition and writer in `Program.cs`.
+
+`tests/FakeGenerator.Tests/Unit/SampleEntity/` holds a test-only example (a "Ticket" entity with a different partition key and a 3-state lifecycle).
 
 ## Tests
 
