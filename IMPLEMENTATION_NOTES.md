@@ -23,15 +23,20 @@
 - SQL fencing protects database operations. Kafka transactional producer fencing is also used because a SQL token alone cannot prevent a stale process from writing to Kafka.
 - The current order generator still uses `MAX(SequenceNo)` and is not safe to run in multiple generator instances. This revision targets multi-instance publisher ownership, not multi-instance order generation.
 
-## Validation status (updated from real output)
+## Validation status (2026-11-18, real output)
 
-- `dotnet build FakeGenerator.sln -c Release`: 0 warnings, 0 errors.
-- `dotnet test tests/FakeGenerator.Tests -c Release`: **94 passed, 13 skipped, 0 failed**.
-- **Not run** (skipped because `FAKEGEN_TEST_SQL` / `FAKEGEN_TEST_KAFKA` are not set; no SQL Server or Kafka broker was available):
-  - SQL: `MigrationIdempotencyTests`, `GeneratorAtomicityTests`, `GeneratorRestartTests`, `OutboxSelectionTests`, `LeaseLifecycleTests` (2 tests), `SqlLeaseConcurrencyTests`.
-  - Kafka: `PublisherKafkaTests`, `TopicValidationTests` (missing topic, too few partitions), `FencingTests`.
-  - Both variables: `TwoInstanceE2ETests`, `ConsumerDeduplicationE2ETests`.
-- Not exercised against a real database: OPENJSON `DATETIME2(3)` parsing, the lease-partition CTE in `EnsureLeasePartitionsAsync`, the filtered index in `04-lifecycle.sql`, and the `--verify` stream read (`StreamVerifier` I/O; its logic is unit-tested in `StreamVerifierCore`).
-- The 500K-event E2E run (quickstart) and the docs/spec.md section 12 acceptance check were **not run**.
+- Latest Release solution build: **0 warnings, 0 errors** (`reports/code-review/final-build.log`).
+- Latest full test suite with real SQL/Kafka and review regressions: **130 passed, 0 failed, 0 skipped** (`reports/code-review/final-tests.log`).
+- The clean 500K run passed: **500,000 generated and published**, zero pending/dead-lettered/missing/ordering/lifecycle violations; `--verify` exited 0.
+- Throughput: **1,384.62 events/second** over 361.109 seconds. First valid full-run baseline created.
+- Two publishers initially owned three partitions each. After forcibly killing B, C took over in **14.1176529 seconds**, below the configured 15-second lease + 3-second renewal bound.
+- Negative lifecycle and three-partition topology checks failed with their expected validation errors and no changes to the checked SQL counts.
+- Real SQL retry/dead-letter checks passed at MaxRetryCount=3, including head-of-line blocking, advancing after dead letter, and LastError truncation to 2,000 characters.
+- Full acceptance matrix, resource names, evidence locations, and defects fixed during the run: [docs/e2e-validation.md](docs/e2e-validation.md).
+- T063 fixed-point review against `62bcc36` completed: two Standards findings and five Spec/reporting findings fixed. See [docs/code-review-62bcc36.md](docs/code-review-62bcc36.md).
+- The revised verifier passed a 500K replay from the retained SQL data into a fresh six-partition topic: complete consumption, zero ordering/lifecycle/missing findings, exit 0. The original Kafka topic was unavailable; replay did not modify the SQL source or constitute a new generation/performance run.
+- Not run: a fresh post-review 500K generation/crash benchmark, a second independent performance sample, and production deployment.
 
-This revision is an implementation candidate, not a claim of production readiness. Run the full build and integration matrix with .NET 8, SQL Server, and Kafka before deployment.
+Outbox reads now take a short shared table lock to prevent concurrent inserts being missed during the ordered scan. The initial range-lock-only fix caused deadlocks and was rejected. The final shared-table-lock implementation passed the full 500K verification and 108 tests. Expected at-least-once duplicates are counted without failing verification; consumer Inbox deduplication remains required. Kafka integration tests use isolated temporary topics.
+
+Review fixes add continuous capacity claims and fenced finalization of exhausted rows after retry-limit reductions. Reports now reject unresolved/short runs and partial stream reads, restrict baselines to 500K samples, count every SQL dead-letter-affected order, and return null for unmeasured `GeneratedThisRun` rather than inferring it from a potentially unrelated report. The 130-test result above covers these changes; the earlier 108-test/500K evidence is historical.

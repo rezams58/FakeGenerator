@@ -148,10 +148,10 @@ description: "Task list for Fake Data Generation and Ordered Event Publishing"
 - [X] T057 [P] Unit tests for lifecycle and ordering checks of the verifier core logic (valid path, bad path, gap from dead letter counted as gap not violation, duplicate) in `tests/FakeGenerator.Tests/Unit/StreamVerifierLogicTests.cs`
 - [X] T058 [P] Update `src/README.md`: new settings, lifecycle config, `--verify`, at-least-once wording, consumer Inbox contract, constraint that `Kafka:PartitionCount` must not change after events exist, that only one generator instance may run at a time, and that all instances must share bootstrap servers, topic, partition count and `ClientId` (different values are unsupported)
 - [X] T059 [P] Update `IMPLEMENTATION_NOTES.md` with real build/test results and the list of tests not run
-- [ ] T060 Run the full E2E from `specs/001-fake-data-kafka-publishing/quickstart.md` (500K events, two instances, kill one, `--verify`); record real counts
-- [ ] T061 Verify the docs/spec.md §12 acceptance criteria one by one against real output
+- [X] T060 Run the full E2E from `specs/001-fake-data-kafka-publishing/quickstart.md` (500K events, two instances, kill one, `--verify`); record real counts
+- [X] T061 Verify the docs/spec.md §12 acceptance criteria one by one against real output
 - [X] T062 Remove the Sync Impact Report HTML comment at the top of `.specify/memory/constitution.md` before the commit
-- [ ] T063 Produce the final report (changed files, architecture, real build/test output, tests not run, residual risks), then run `/code-review 62bcc36`
+- [X] T063 Produce the final report (changed files, architecture, real build/test output, tests not run, residual risks), then run `/code-review 62bcc36`
 
 ---
 

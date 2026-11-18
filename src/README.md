@@ -47,6 +47,8 @@ Important settings:
 
 The sample defaults `MaxPartitionsPerInstance` to `6`, favoring one-instance throughput. If you deploy multiple instances, adjust this value to distribute the six partitions instead of allowing the first process to claim all available partitions.
 
+The publisher keeps checking for expired partitions while it has spare capacity, without waiting for its healthy lanes to stop. Lowering `MaxRetryCount` finalizes already-exhausted pending rows as dead letters under the current lease before selecting later events; their original error and retry count are preserved.
+
 ## Run
 
 ```bash
@@ -97,6 +99,12 @@ dotnet run --project src -- --verify
 ```
 
 It reads the whole topic with a `read_committed` consumer, checks duplicates, per-partition `sequence-no` order, per-order lifecycle paths, dead-letter gaps and events missing on the stream (compared with SQL), then writes `reports/run-{utc}.json` and compares throughput with `reports/baseline.{Environment}.json` (created on the first full run). Exit code is non-zero on any violation or regression above the threshold.
+
+Expected at-least-once replays are counted as duplicates without failing verification. The Inbox consumer must still deduplicate them. A throughput baseline is created only for a complete run whose verification passed.
+
+Verification succeeds only when the configured target is reached, every event is published or dead-lettered, and every captured Kafka partition end is reached. `VerifierComplete=false` fails the run. Performance baselines apply only to complete 500,000-event samples. `GeneratedThisRun` is null unless a generation-start count was explicitly captured; the verifier does not infer it from another report or database.
+
+Outbox reads take a short shared table lock while selecting an ordered batch. This prevents concurrent generator inserts from appearing partway through a read and overtaking a lower sequence. The lock is released before Kafka publishing; benchmark throughput on the target SQL Server deployment.
 
 ## Adding a new entity
 
