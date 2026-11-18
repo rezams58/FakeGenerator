@@ -33,6 +33,7 @@ public sealed class ConsumerDeduplicationE2ETests
     [SqlKafkaFact]
     public async Task Replay_after_crash_republishes_same_event_ids_and_inbox_applies_each_effect_once()
     {
+        await using var topic = await TestTopic.CreateAsync();
         string cs = TestEnv.Sql!;
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(180));
         await Sql.SqlTestSupport.ApplySchemaAsync(cs, cts.Token);
@@ -40,9 +41,9 @@ public sealed class ConsumerDeduplicationE2ETests
 
         var real = new SqlOrderRepository(Options.Create(new ConnectionSettings { SqlServer = cs }));
         var repo = new CrashOnceRepository(real);
-        var kafka = new KafkaSettings { BootstrapServers = TestEnv.Kafka!, Topic = "orders", ClientId = $"dedup-{Guid.NewGuid():N}" };
+        var kafka = new KafkaSettings { BootstrapServers = TestEnv.Kafka!, Topic = topic.Name, ClientId = $"dedup-{Guid.NewGuid():N}" };
         await real.EnsureLeasePartitionsAsync(kafka.PartitionCount, cts.Token);
-        await Sql.SqlTestSupport.ScalarAsync(cs, "UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = SYSUTCDATETIME(); SELECT 1", cts.Token);
+        await Sql.SqlTestSupport.ScalarAsync(cs, "UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = DATEADD(SECOND, -1, SYSUTCDATETIME()); SELECT 1", cts.Token);
         // Make sure nothing else is pending, so only this test's events are published.
         await Sql.SqlTestSupport.ScalarAsync(cs,
             "UPDATE dbo.Outbox SET PublishedAtUtc = SYSUTCDATETIME() WHERE PublishedAtUtc IS NULL AND DeadLetterAtUtc IS NULL; SELECT 1", cts.Token);

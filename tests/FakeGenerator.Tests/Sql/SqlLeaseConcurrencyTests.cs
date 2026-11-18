@@ -21,7 +21,7 @@ public sealed class SqlLeaseConcurrencyTests
         await using (var reset = new SqlConnection(connectionString))
         {
             await reset.OpenAsync(cts.Token);
-            await using var cmd = new SqlCommand("UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = SYSUTCDATETIME();", reset);
+            await using var cmd = new SqlCommand("UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = DATEADD(SECOND, -1, SYSUTCDATETIME());", reset);
             await cmd.ExecuteNonQueryAsync(cts.Token);
         }
 

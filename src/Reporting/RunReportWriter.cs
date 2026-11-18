@@ -18,7 +18,7 @@ public sealed class RunReportWriter
     }
 
     public async Task<RunReport> BuildAsync(DateTime startedAtUtc, long targetEventCount, IReadOnlyCollection<string> terminalStates,
-        VerificationResult? verification, CancellationToken ct)
+        VerificationResult? verification, CancellationToken ct, long? generationStartCount = null)
     {
         var report = new RunReport
         {
@@ -55,8 +55,21 @@ public sealed class RunReportWriter
             report.EventsPerSecond = Math.Round(report.Published / (hi - lo).TotalSeconds, 2);
         }
 
-        var previous = LoadPreviousTotal();
-        report.GeneratedThisRun = previous is null ? report.GeneratedTotal : Math.Max(0, report.GeneratedTotal - previous.Value);
+        ct.ThrowIfCancellationRequested();
+        return Complete(report, verification, generationStartCount);
+    }
+
+    public RunReport Complete(RunReport report, VerificationResult? verification, long? generationStartCount = null)
+    {
+        // A previous verifier report may describe another database or an earlier reset.
+        // Only an explicitly captured start count can measure generation in this run.
+        report.GeneratedThisRun = generationStartCount is long start && start >= 0 && start <= report.GeneratedTotal
+            ? report.GeneratedTotal - start : null;
+        if (report.GeneratedTotal != report.TargetEventCount)
+            report.Failures.Add($"generated {report.GeneratedTotal} events; target is {report.TargetEventCount}");
+        if (report.Pending > 0) report.Failures.Add($"{report.Pending} events still pending");
+        if (report.Published + report.DeadLettered != report.GeneratedTotal)
+            report.Failures.Add("published and dead-lettered counts do not account for all generated events");
 
         if (verification is not null)
         {
@@ -65,12 +78,14 @@ public sealed class RunReportWriter
             report.LifecycleViolations = verification.LifecycleViolations;
             report.DeadLetterGaps = verification.DeadLetterGaps;
             report.MissingOnStream = verification.MissingOnStream;
-            report.VerifierStatus = verification.HasViolations ? "failed" : "passed";
+            report.VerifierComplete = verification.Complete;
+            report.VerifierStatus = !verification.Complete ? "incomplete" : verification.HasViolations ? "failed" : "passed";
+            if (!verification.Complete) report.Failures.Add("stream verification did not reach every captured partition end");
             if (verification.OrderingViolations > 0) report.Failures.Add($"{verification.OrderingViolations} ordering violations");
             if (verification.LifecycleViolations > 0) report.Failures.Add($"{verification.LifecycleViolations} lifecycle violations");
             if (verification.MissingOnStream > 0) report.Failures.Add($"{verification.MissingOnStream} published events missing on the stream");
-            if (verification.Duplicates > 0) report.Failures.Add($"{verification.Duplicates} duplicate deliveries (consumers must deduplicate by event-id)");
         }
+        else report.Failures.Add("stream verification was not run");
 
         ApplyBaseline(report);
         report.Passed = report.Failures.Count == 0;
@@ -79,8 +94,9 @@ public sealed class RunReportWriter
 
     private void ApplyBaseline(RunReport report)
     {
-        // Only a full run (target reached, nothing pending) is a valid performance sample.
-        if (report.EventsPerSecond is null || report.Pending > 0 || report.GeneratedTotal < report.TargetEventCount) return;
+        // Only the specified 500K sample is comparable with the environment baseline.
+        if (report.TargetEventCount != 500000 || report.EventsPerSecond is null || report.Pending > 0 || report.GeneratedTotal != report.TargetEventCount ||
+            report.VerifierStatus != "passed" || report.Failures.Count > 0) return;
         string path = Path.Combine(_reporting.Directory, $"baseline.{_reporting.Environment}.json");
         double? baseline = null;
         if (File.Exists(path))
@@ -97,15 +113,6 @@ public sealed class RunReportWriter
             Directory.CreateDirectory(_reporting.Directory);
             File.WriteAllText(path, JsonSerializer.Serialize(new { eventsPerSecond = report.EventsPerSecond, createdAtUtc = DateTime.UtcNow }, Json));
         }
-    }
-
-    private long? LoadPreviousTotal()
-    {
-        if (!Directory.Exists(_reporting.Directory)) return null;
-        var last = Directory.GetFiles(_reporting.Directory, "run-*.json").OrderBy(f => f, StringComparer.Ordinal).LastOrDefault();
-        if (last is null) return null;
-        try { return JsonDocument.Parse(File.ReadAllText(last)).RootElement.GetProperty("GeneratedTotal").GetInt64(); }
-        catch { return null; }
     }
 
     public string Write(RunReport report)

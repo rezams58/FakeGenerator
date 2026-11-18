@@ -13,7 +13,7 @@ public sealed class LeaseLifecycleTests
         await SqlTestSupport.ApplySchemaAsync(cs, ct);
         var repo = new SqlOrderRepository(Options.Create(new ConnectionSettings { SqlServer = cs }));
         await repo.EnsureLeasePartitionsAsync(6, ct);
-        await SqlTestSupport.ScalarAsync(cs, "UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = SYSUTCDATETIME(); SELECT 1", ct);
+        await SqlTestSupport.ScalarAsync(cs, "UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = DATEADD(SECOND, -1, SYSUTCDATETIME()); SELECT 1", ct);
         return (repo, cs);
     }
 
@@ -40,7 +40,7 @@ public sealed class LeaseLifecycleTests
         var (repo, cs) = await SetupAsync(cts.Token);
         var oldLease = (await repo.ClaimPartitionsAsync(Guid.NewGuid(), 1, 60, cts.Token)).Single();
         await SqlTestSupport.ScalarAsync(cs,
-            $"UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = SYSUTCDATETIME() WHERE PartitionId = {oldLease.PartitionId}; SELECT 1", cts.Token);
+            $"UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = DATEADD(SECOND, -1, SYSUTCDATETIME()) WHERE PartitionId = {oldLease.PartitionId}; SELECT 1", cts.Token);
 
         var newLease = (await repo.ClaimPartitionsAsync(Guid.NewGuid(), 6, 60, cts.Token)).Single(l => l.PartitionId == oldLease.PartitionId);
         Assert.Equal(oldLease.FencingToken + 1, newLease.FencingToken);

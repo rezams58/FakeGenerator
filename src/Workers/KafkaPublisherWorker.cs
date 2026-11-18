@@ -54,41 +54,39 @@ public sealed class KafkaPublisherWorker : BackgroundService
         _logger.LogInformation("Publisher {OwnerId} started for topic {Topic}; expected partitions={Count}",
                                 _ownerId, _kafkaSetting.Topic, _kafkaSetting.PartitionCount);
 
-        while (!stoppingToken.IsCancellationRequested)
+        var lanes = new Dictionary<int, Task>();
+        using var lanesCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        try
         {
-            var leases = await _repository.ClaimPartitionsAsync(_ownerId, _maxPartitions, _leaseSeconds, stoppingToken);
-            if (leases.Count == 0)
+            while (!stoppingToken.IsCancellationRequested)
             {
-                await Task.Delay(Math.Max(_idleDelay, 500), stoppingToken);
-                continue;
-            }
-
-            var tasks = leases.Select(lease => RunPartitionLoopAsync(lease, stoppingToken)).ToArray();
-            await Task.WhenAll(tasks);
-        }
-    }
-
-
-    private async Task RunPartitionLoopAsync(PartitionLease initialLease, CancellationToken stoppingToken)
-    {
-        PartitionLease? lease = initialLease;
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            if (lease is null)
-            {
-                var next = await _repository.ClaimPartitionsAsync(_ownerId, 1, _leaseSeconds, stoppingToken);
-                if (next.Count == 0)
+                foreach (var completed in lanes.Where(l => l.Value.IsCompleted).ToArray())
                 {
-                    await Task.Delay(Math.Max(_idleDelay, 500), stoppingToken);
-                    continue;
+                    await completed.Value;
+                    lanes.Remove(completed.Key);
                 }
-                lease = next[0];
-            }
 
-            await RunPartitionAsync(lease, stoppingToken);
-            lease = null;
-            if (!stoppingToken.IsCancellationRequested)
-                await Task.Delay(500, stoppingToken);
+                int capacity = _maxPartitions - lanes.Count;
+                if (capacity > 0)
+                {
+                    var leases = await _repository.ClaimPartitionsAsync(_ownerId, capacity, _leaseSeconds, stoppingToken);
+                    foreach (var lease in leases)
+                        lanes.Add(lease.PartitionId, RunPartitionAsync(lease, lanesCts.Token));
+                }
+
+                // Keep checking spare capacity while existing lanes remain active.
+                // A healthy lane must not prevent taking over another owner's expired partition.
+                await Task.Delay(Math.Max(_idleDelay, 500), stoppingToken);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Normal host shutdown; every active lane observes the same cancellation.
+        }
+        finally
+        {
+            lanesCts.Cancel();
+            await Task.WhenAll(lanes.Values);
         }
     }
 

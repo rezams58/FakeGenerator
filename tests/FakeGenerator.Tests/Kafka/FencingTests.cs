@@ -9,7 +9,8 @@ public sealed class FencingTests
     [KafkaFact]
     public async Task Second_producer_with_same_transactional_id_fences_the_first()
     {
-        var settings = new KafkaSettings { BootstrapServers = TestEnv.Kafka!, Topic = "orders", ClientId = $"fence-{Guid.NewGuid():N}" };
+        await using var topic = await TestTopic.CreateAsync();
+        var settings = new KafkaSettings { BootstrapServers = TestEnv.Kafka!, Topic = topic.Name, ClientId = $"fence-{Guid.NewGuid():N}" };
         OutboxMessage Msg(long n) => new(Guid.NewGuid(), n, "FENCE", 0, "OrderCreated", "{}");
 
         using var zombie = new PartitionedKafkaPublisher(settings, 0);

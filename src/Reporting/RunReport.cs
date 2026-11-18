@@ -9,7 +9,8 @@ public sealed class RunReport
     public string Environment { get; set; } = "";
     public long TargetEventCount { get; set; }
     public long GeneratedTotal { get; set; }
-    public long GeneratedThisRun { get; set; }
+    /// <summary>Null unless the generation-start count was captured for this run.</summary>
+    public long? GeneratedThisRun { get; set; }
     public long OrdersGenerated { get; set; }
     public long Published { get; set; }
     public long DeadLettered { get; set; }
@@ -24,6 +25,7 @@ public sealed class RunReport
     public long? DeadLetterGaps { get; set; }
     public long? MissingOnStream { get; set; }
     public string VerifierStatus { get; set; } = "not run";
+    public bool? VerifierComplete { get; set; }
 
     public double? BaselineEventsPerSecond { get; set; }
     public double? RegressionPercent { get; set; }

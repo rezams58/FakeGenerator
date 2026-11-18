@@ -10,7 +10,8 @@ public sealed class PublisherKafkaTests
     [KafkaFact]
     public async Task Batch_is_committed_to_its_partition_in_sequence_order()
     {
-        var settings = new KafkaSettings { BootstrapServers = TestEnv.Kafka!, Topic = "orders", ClientId = $"test-{Guid.NewGuid():N}" };
+        await using var topic = await TestTopic.CreateAsync();
+        var settings = new KafkaSettings { BootstrapServers = TestEnv.Kafka!, Topic = topic.Name, ClientId = $"test-{Guid.NewGuid():N}" };
         const int partition = 0;
         string key = $"K-{Guid.NewGuid():N}";
         var batch = Enumerable.Range(1, 20).Select(i =>

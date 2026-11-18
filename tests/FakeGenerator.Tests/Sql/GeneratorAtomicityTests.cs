@@ -7,6 +7,7 @@ using Microsoft.Extensions.Options;
 
 namespace FakeGenerator.Tests.Sql;
 
+[Collection("SqlLease")]
 public sealed class GeneratorAtomicityTests
 {
     [SqlFact]

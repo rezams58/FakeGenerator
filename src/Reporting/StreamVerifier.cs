@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Diagnostics;
 using Confluent.Kafka;
 using FakeOrderGenerator.Configuration;
 using FakeOrderGenerator.Generation;
@@ -24,6 +25,7 @@ public sealed class StreamVerifier
 
     public async Task<VerificationResult> VerifyAsync(LifecycleDefinition lifecycle, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         var deadEntities = new HashSet<Guid>();
         var published = new HashSet<Guid>();
         await using (var cn = new SqlConnection(_connectionString))
@@ -39,11 +41,12 @@ public sealed class StreamVerifier
                 while (await r.ReadAsync(ct)) published.Add(r.GetGuid(0));
         }
 
-        var records = ReadStream(ct);
-        return StreamVerifierCore.Verify(records, lifecycle, deadEntities, published);
+        var stream = ReadStream(ct);
+        ct.ThrowIfCancellationRequested();
+        return StreamVerifierCore.Verify(stream.Records, lifecycle, deadEntities, published) with { Complete = stream.Complete };
     }
 
-    private List<StreamRecord> ReadStream(CancellationToken ct)
+    private (List<StreamRecord> Records, bool Complete) ReadStream(CancellationToken ct)
     {
         using var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
         {
@@ -51,6 +54,7 @@ public sealed class StreamVerifier
             GroupId = $"fakegen-verify-{Guid.NewGuid():N}",
             IsolationLevel = IsolationLevel.ReadCommitted,
             EnableAutoCommit = false,
+            EnablePartitionEof = true,
             AutoOffsetReset = AutoOffsetReset.Earliest
         }).Build();
 
@@ -58,24 +62,59 @@ public sealed class StreamVerifier
         var ends = partitions.ToDictionary(tp => tp, tp => consumer.QueryWatermarkOffsets(tp, TimeSpan.FromSeconds(30)).High.Value);
         consumer.Assign(partitions.Select(tp => new TopicPartitionOffset(tp, Offset.Beginning)));
 
+        return ReadCapturedStream(consumer, ends, ct);
+    }
+
+    public static (List<StreamRecord> Records, bool Complete) ReadCapturedStream(IConsumer<string, string> consumer,
+        IReadOnlyDictionary<TopicPartition, long> ends, CancellationToken ct, TimeSpan? idleTimeout = null)
+    {
+        ct.ThrowIfCancellationRequested();
         var result = new List<StreamRecord>();
-        var pending = new HashSet<TopicPartition>(partitions.Where(tp => ends[tp] > 0));
-        var lastProgress = DateTime.UtcNow;
-        while (pending.Count > 0 && !ct.IsCancellationRequested)
+        var pending = new HashSet<TopicPartition>(ends.Keys.Where(tp => ends[tp] > 0));
+        var idle = Stopwatch.StartNew();
+        var positions = new Dictionary<TopicPartition, long>();
+        // Completed partitions must not keep supplying newly appended records while others catch up.
+        var empty = ends.Keys.Where(tp => !pending.Contains(tp)).ToList();
+        if (empty.Count > 0) consumer.Pause(empty);
+        while (pending.Count > 0)
         {
+            ct.ThrowIfCancellationRequested();
             var cr = consumer.Consume(TimeSpan.FromSeconds(2));
-            if (cr is not null && !cr.IsPartitionEOF)
+            ct.ThrowIfCancellationRequested();
+            if (cr is not null && pending.Contains(cr.TopicPartition))
             {
-                lastProgress = DateTime.UtcNow;
-                var rec = Parse(cr);
-                if (rec is not null) result.Add(rec);
+                if (!cr.IsPartitionEOF && cr.Offset.Value < ends[cr.TopicPartition])
+                {
+                    idle.Restart();
+                    var rec = Parse(cr);
+                    if (rec is not null) result.Add(rec);
+                }
+                // EOF includes skipped transaction-control/aborted offsets, unlike the last data record.
+                if (cr.IsPartitionEOF && cr.Offset.Value >= ends[cr.TopicPartition])
+                {
+                    pending.Remove(cr.TopicPartition);
+                    consumer.Pause([cr.TopicPartition]);
+                    idle.Restart();
+                }
             }
-            // Position also advances past transaction control markers, so it reaches the end offset.
             foreach (var tp in pending.ToList())
-                if (consumer.Position(tp).Value >= ends[tp]) pending.Remove(tp);
-            if (DateTime.UtcNow - lastProgress > TimeSpan.FromSeconds(30)) break; // nothing more committed to read
+            {
+                long position = consumer.Position(tp).Value;
+                if (position >= 0 && (!positions.TryGetValue(tp, out long previous) || position > previous))
+                {
+                    positions[tp] = position;
+                    idle.Restart();
+                }
+                if (position >= ends[tp])
+                {
+                    pending.Remove(tp);
+                    consumer.Pause([tp]);
+                }
+            }
+            if (idle.Elapsed >= (idleTimeout ?? TimeSpan.FromSeconds(30))) break;
         }
-        return result;
+        ct.ThrowIfCancellationRequested();
+        return (result, pending.Count == 0);
     }
 
     private static StreamRecord? Parse(ConsumeResult<string, string> cr)

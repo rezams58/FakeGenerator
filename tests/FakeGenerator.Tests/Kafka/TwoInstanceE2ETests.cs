@@ -14,13 +14,14 @@ public sealed class TwoInstanceE2ETests
     [SqlKafkaFact]
     public async Task Dead_instance_is_taken_over_within_lease_plus_renew_and_no_event_is_lost()
     {
+        await using var topic = await TestTopic.CreateAsync();
         string cs = TestEnv.Sql!;
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
         await Sql.SqlTestSupport.ApplySchemaAsync(cs, cts.Token);
         var repo = new SqlOrderRepository(Options.Create(new ConnectionSettings { SqlServer = cs }));
-        var kafka = new KafkaSettings { BootstrapServers = TestEnv.Kafka!, Topic = "orders", ClientId = $"e2e-{Guid.NewGuid():N}" };
+        var kafka = new KafkaSettings { BootstrapServers = TestEnv.Kafka!, Topic = topic.Name, ClientId = $"e2e-{Guid.NewGuid():N}" };
         await repo.EnsureLeasePartitionsAsync(kafka.PartitionCount, cts.Token);
-        await Sql.SqlTestSupport.ScalarAsync(cs, "UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = SYSUTCDATETIME(); SELECT 1", cts.Token);
+        await Sql.SqlTestSupport.ScalarAsync(cs, "UPDATE dbo.PublisherPartitionLease SET LeaseUntilUtc = DATEADD(SECOND, -1, SYSUTCDATETIME()); SELECT 1", cts.Token);
 
         const int leaseSeconds = 6, renewSeconds = 2;
         // "Instance A" claims every partition and then dies: it never renews or releases.
