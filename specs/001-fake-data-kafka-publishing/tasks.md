@@ -193,3 +193,155 @@ description: "Task list for Fake Data Generation and Ordered Event Publishing"
 | SC-004 | T054, T055 |
 | SC-007, SC-009 | T051, T053, T056 |
 | SC-008 | T047, T048 |
+
+## v2 execution plan — regenerated 2026-11-22
+
+Inputs: current spec FR-025–037/SC-011–016, plan Phase 0/1, research R10–R16,
+data-model and contracts/v2-processing.md. T001–T063 above are completed v1 history.
+Existing T064–T084 IDs remain stable for cross-agent handoffs; newly decomposed work
+uses T085–T100. Phase order and dependencies below determine execution, not numeric
+sorting. All v2 tasks are pending. Tests are required by specification/constitution.
+
+## Phase 8: Setup
+
+- [ ] T064 Verify actual broker API/topic-ID/transaction compatibility with Java17/Streams4.1.2 design target; pin Maven plugins, Streams, test libraries and Java17-compatible Microsoft JDBC driver, produce finalizer.jar in `services/finalizer/pom.xml`; record supported/rejected profiles in `specs/001-fake-data-kafka-publishing/research.md`
+- [ ] T065 Define decimal-json-v1 positive/negative cross-language fixtures with expected canonical bytes and SHA-256 in `tests/contracts/event-fingerprints.json`: exact decimals beyond 2^53, negative zero, astral Unicode keys, escapes, object/array order, duplicate keys and all contract limits
+
+## Phase 9: Shared foundation — blocks all v2 stories
+
+Tests precede their implementations. Complete this phase before US5 integration.
+
+- [ ] T085 [P] Add fixture-driven failing tests in `tests/FakeGenerator.Tests/Unit/EventCanonicalizerTests.cs` and `services/finalizer/src/test/java/fakegen/EventCanonicalizerTest.java`; enforce depth >64, number token >1024 characters, absolute exponent >10000 and payload >1 MiB rejection
+- [ ] T067 [P] Add ordered 05-pipeline then 06-run migration-twice on clean/legacy databases, FK enforcement (unknown PipelineId rejected), legacy identity, explicit new/resume, nonempty database second run and transaction/closure interruption tests in `tests/FakeGenerator.Tests/Sql/GenerationRunTests.cs`
+- [ ] T086 [P] Add registry/provisioning-resume, unique final destination and audit-boundary tests in `tests/FakeGenerator.Tests/Sql/PipelineRegistrationTests.cs`
+- [ ] T087 Implement decimal-json-v1 exact-number typed grammar and hash in `src/Reporting/EventCanonicalizer.cs` and `services/finalizer/src/main/java/fakegen/EventCanonicalizer.java`; pass T085 fixtures without float conversion
+- [ ] T089 Implement PipelineRegistration/AuditBoundary schema and repositories in `src/sql/05-pipeline-registration.sql` and `src/Data/PipelineRegistrationRepository.cs`: "unique ClusterId+FinalTopicId", "Provisioning|Ready|Suspended|Retired", "RegisteredStartOffset bigint >=0", "Partition in 0..5", immutable topic IDs/config versions, U8 barrier/epoch/lane-ack tables and repeatable migrations; pass T086
+- [ ] T066 Add idempotent run migration in `src/sql/06-generation-runs.sql`: "TargetEventCount bigint >0", "GeneratedCount bigint between 0 and target", "State Active|Closed", "ClosedAtUtc required iff Closed", GenerationRun.PipelineId FK to the already-created PipelineRegistration table (requires T089), unique filtered Active index, immutable Outbox RunId/content and explicit legacy mapping; preserve existing EventIds
+- [ ] T088 Implement transactional entity/Outbox/progress/final-closure and per-run targets in `src/Data/GenerationRunRepository.cs`, `src/Data/SqlOrderRepository.cs` and `src/Workers/GeneratorWorker.cs`; retain global sequence, fresh entity pool per run, resume identity and no unintended new run; pass T067
+- [ ] T090 Implement explicit --new-run/--run-id/--pipeline-id dispatch and provisioning command in `src/Program.cs` and `src/Kafka/PipelineProvisioner.cs`; create/register fresh empty ingress/final/internal topics and audit starts, resume interrupted provisioning, restrict roles, and transition Ready only after bootstrap validation
+- [ ] T075 Add ingress/final/pipeline settings, validation and run-id headers in `src/Configuration/GeneratorSettings.cs`, `src/Configuration/OptionsValidators.cs`, `src/Kafka/PartitionedKafkaPublisher.cs` and `src/appsettings.json`; carry RunId through `src/Data/Partitioning.cs`; reject non-six partitions and inconsistent identity
+- [ ] T091 Test CLI lifecycle, RunId persistence/headers, fresh-topic provisioning and permissions in `tests/FakeGenerator.Tests/Kafka/PipelineFoundationTests.cs`; run SQL migration tests and both canonicalizer suites and record real results in `docs/final-topic-v2-validation.md`
+
+## Phase 10: US5 — strict verification (P1)
+
+Goal: certify exact equality for a selected closed run. Independent test uses seeded
+committed final-topic fixtures; no running finalizer is needed. Missing-plus-extra
+with equal counts, duplicates, malformed records and incomplete history must fail.
+
+- [ ] T068 [P] [US5] Add failing core tests for all-generated comparison, exact sets/hash/routing, other recognized runs vs unknown runs, expired starts and partial ends in `tests/FakeGenerator.Tests/Unit/StrictVerifierTests.cs`
+- [ ] T092 [P] [US5] Add strict report/exit-code and versioned-baseline tests in `tests/FakeGenerator.Tests/Unit/StrictReportTests.cs`; duplicates/dead letters/incomplete runs cannot pass or create a baseline; v1 baselines never reused
+- [ ] T069 [US5] Implement registered-start/captured-end reads and immutable closed manifests in `src/Reporting/StreamVerifier.cs` and `src/Reporting/StreamVerifierCore.cs`; implement U8 epoch barrier via `src/Reporting/VerificationBarrierCoordinator.cs`, admission/ack checks in `src/Workers/KafkaPublisherWorker.cs` and `src/Workers/GeneratorWorker.cs`, and registry new-run admission; wait on broker-committed finalizer offsets through B[p], then audit F[p]; configure a shared 600-second default deadline in `src/Configuration/GeneratorSettings.cs` and validate it in `src/Configuration/OptionsValidators.cs`; count every business record and fail invalid/incomplete scopes
+- [ ] T093 [US5] Persist VerificationSnapshot in `src/sql/07-verification-snapshots.sql` and `src/Reporting/VerificationSnapshotRepository.cs`: "VerificationId PK, RunId FK", manifest digest, "six start/end offsets", captured time/completion and U8 barrier epoch, H/B/F vectors, group committed offsets and failure stage; migration repeatable
+- [ ] T070 [US5] Implement strict report fields and --verify --run-id exit 0/2/3 in `src/Reporting/RunReport.cs`, `src/Reporting/RunReportWriter.cs`, `src/Reporting/BaselineComparer.cs` and `src/Program.cs`; v2 baseline keys include contract/environment/topology/hash/config/replication and final-observer throughput
+- [ ] T071 [US5] Run real SQL/Kafka seeded-stream integration in `tests/FakeGenerator.Tests/Kafka/StrictVerifierIntegrationTests.cs`: two runs, unpublished missing ID, malformed/foreign records, cancellation, truncated retention and equal-count substitution; test pending=0 with finalizer lag, transactional fixture offsets/output, open transactions, control-only tails, lane crash, barrier recovery/release and shared timeout without premature pass; record failures/pass evidence in `docs/final-topic-v2-validation.md`
+
+## Phase 11: US6 — unique final publication (P1)
+
+Goal: immutable identities produce one final record after ingress replay. Independent
+gate injects duplicates/conflicts across partitions and restarts; compare via US5.
+
+- [ ] T072 [P] [US6] Add failing replay/conflict/partition-order topology tests in `services/finalizer/src/test/java/fakegen/FinalizerTopologyTest.java`
+- [ ] T094 [P] [US6] Add failing immutable SQL catalog, unknown identity, changed key/partition and outage tests in `services/finalizer/src/test/java/fakegen/CatalogValidatorTest.java`
+- [ ] T095 [US6] Implement bounded batched read-only JDBC catalog validation and immutable-positive cache in `services/finalizer/src/main/java/fakegen/CatalogValidator.java`; compare EventId globally against RunId/type/key/sequence/partition/hash before first forwarding, never advance offsets on SQL failure
+- [ ] T073 [US6] Implement persistent logged partition-local store and explicit source-partition forwarding in `services/finalizer/src/main/java/fakegen/FinalizerTopology.java`; atomically commit state/final records/offsets under EOS-v2, suppress identical replay and stop conflicting partition without global repartition
+- [ ] T096 [US6] Prove supported assignment/restoration lifecycle hooks on pinned Streams and test U7 token invalidation, old-owner unresolved commit/abort, late callback and rebalance at each gate transition; add bootstrap/changed-app-ID/topic-UUID/empty-state tests in `services/finalizer/src/test/java/fakegen/PipelineGuardTest.java` before implementing guards
+- [ ] T074 [US6] Implement config/preflight/registry/ACL/retention gates and --check-only in `services/finalizer/src/main/java/fakegen/FinalizerApplication.java` and `services/finalizer/src/main/java/fakegen/PipelineGuard.java`; honor Provisioning vs Ready, forbid auto-recreating Ready state, bind stable application.id, enforce acks/idempotence/LZ4
+- [ ] T097 [US6] Implement per-assignment restore/output audit and rebalance invalidation in `services/finalizer/src/main/java/fakegen/RestoreAudit.java`; enforce U7 OWNERSHIP_READY -> RESTORED -> stable H/C -> AUDITING -> VALIDATED ordering and serialized token recheck before forwarding; discard results on revoke/rebalance and never manipulate Streams producer IDs; require each final ID/hash in restored store, suspend on mismatch; blocked if T096 cannot prove supported hooks
+- [ ] T076 [US6] Run real-broker/catalog replay and ordering integration in `services/finalizer/src/test/java/fakegen/FinalizerIntegrationTest.java`, including conflicts on another partition, all canonical fixtures and multiple finalizer instances; reconcile using US5
+
+## Phase 12: US7 — recovery and migration (P1)
+
+Goal: prove crash/rebalance/reset behavior, including target recovery time. Each
+scenario starts from an isolated provisioned pipeline and an immutable manifest.
+
+- [ ] T077 [US7] Build deterministic barriers and external read_committed monotonic observer in `tests/e2e/FinalTopicFaultRunner/Program.cs` and `tests/e2e/FinalTopicFaultRunner/FinalTopicFaultRunner.csproj`; force ingress commit-before-SQL-mark and measure termination-to-new-final-event upper bound on every affected partition with backlog
+- [ ] T078 [P] [US7] Test finalizer pre/post-commit crash, ambiguous replies, rebalance and stale-owner fencing in `services/finalizer/src/test/java/fakegen/FinalizerRecoveryTest.java`
+- [ ] T079 [P] [US7] Test local-state deletion with intact changelog, missing/recreated changelog, surviving-topic empty state and changed application.id against existing output in `services/finalizer/src/test/java/fakegen/FinalizerRestoreTest.java`; assert fail-before-forward where required
+- [ ] T080 [US7] Add SQL/broker outage, poison/exhausted retries, routing change, bad retention and two-run restart scenarios in `tests/e2e/FinalTopicFaultRunner/Scenarios.cs`; distinguish outages from 18-second single-process recovery and require zero strict errors after recovery
+- [ ] T081 [US7] Document fresh provisioning commands, provisioner/runtime/verifier ACLs, retention/state capacity, rollback suspension and separate consumer-cutover approval in `docs/final-topic-v2-operations.md`; validate commands against implemented CLI
+- [ ] T098 [US7] Execute deterministic fault matrix against isolated SQL/Kafka; record all tests, source commit, offsets, timing uncertainty and unrun reasons in `docs/final-topic-v2-validation.md`; any recovery upper bound >18 seconds remains a failure requiring redesign
+
+## Phase 13: Acceptance and cross-cutting
+
+- [ ] T082 Execute 500000-event strict equality benchmark plus another run in same environment; reconcile each and classify other-run records, final-observer throughput and versioned baseline in `docs/final-topic-v2-validation.md`
+- [ ] T083 Update implemented configuration, architecture, limitations and validated commands in `src/README.md`, `IMPLEMENTATION_NOTES.md` and `specs/001-fake-data-kafka-publishing/quickstart.md`
+- [ ] T099 Validate shared prerequisite resolution and Codex/Claude workflow entry points without private state assumptions; record checked/unavailable adapters in `docs/final-topic-v2-review.md`
+- [ ] T084 Review spec/contract/task coverage, constitution compliance and remaining failures in `docs/final-topic-v2-review.md`; preserve explicit deployment approval and historical v1 evidence
+- [ ] T100 Record final real build/test summaries and strict acceptance status in `docs/final-topic-v2-validation.md`; leave incomplete tasks unchecked and request approval before rollout
+
+## Dependencies and execution order
+
+Setup T064–065 -> foundation -> US5 -> US6 -> US7 -> acceptance.
+Foundation: T065 -> T085 -> T087; T086 -> T089; T067 + T089 -> T066 -> T088;
+T086 -> T089 -> T090; T087/T088/T089/T090 -> T075 -> T091.
+US5: T068/T092 -> T069 -> T093 -> T070 -> T071.
+US6: T072/T094 -> T095 -> T073 -> T096 -> T074 -> T097 -> T076.
+US7: T077 -> T078/T079 -> T080 -> T081 -> T098.
+Finish T082 -> T083 -> T099 -> T084 -> T100.
+All test tasks must demonstrate the intended failure before implementation where
+applicable; no framework-only tests substituted for crash/recovery evidence.
+
+Parallel examples: after setup, T085/T067/T086 touch separate test files; within US5,
+T068 and T092 may be authored together; within US6, T072 and T094; within US7, T078
+and T079. Shared broker executions require isolated topic/application IDs. These are
+scheduling options, not permission to spawn agents. One writer owns tasks.md.
+
+MVP: foundation plus US5 produces an honest strict verifier using seeded final-topic
+fixtures. It deliberately fails today's duplicate output; it does not certify final
+publication until US6/US7 and acceptance pass. Stop at each user-approved stage gate.
+
+## v2 coverage matrix
+
+| Requirement | Tasks |
+|---|---|
+| FR-025/026/031 | T068–071, T092–093, T082 |
+| FR-027 | T072–074, T076, T078–079, T097 |
+| FR-028/033 | T066–067, T075, T088, T091, T080 |
+| FR-029/036 | T072–076, T094–095, T080 |
+| FR-030/034 | T074, T079–081, T086, T089–090, T096–098 |
+| FR-032 | T068–071, T089, T093, T082 |
+| FR-035 | T065, T085, T087, T076 |
+| FR-037 | T070, T092, T082 |
+| SC-011/012 | T076–080, T098, T082 |
+| SC-013 | T077–078, T098, T082 |
+| SC-014/015 | T067, T088, T071, T080, T082 |
+| SC-016 | T065, T085, T087, T094–097, T079 |
+
+All v2 tasks map to these requirements or shared setup/quality gates. Prior v1
+coverage remains above; it is not runtime proof of v2. Analysis I1 is addressed by
+moving T075 into foundation; T064 must keep R10–R16 current, and T070 isolates v1
+baselines (I2). Run speckit-analyze before implementation; do not infer analysis pass
+from this task generation.
+
+## U9 additional blocking task — 2026-11-23
+
+- [ ] T101 [US6] Before T073/T074/T095/T097, prototype supported partition-local retry/isolation for pinned Streams in `tests/feasibility/finalizer-isolation/pom.xml` and `tests/feasibility/finalizer-isolation/src/test/java/fakegen/IsolationTest.java`; inject catalog/validation failures with multiple tasks, verify heartbeats, no failed-offset advancement/overtaking and continued healthy commits across rebalance; record task/thread/transaction evidence and supported API policy in `docs/finalizer-isolation-feasibility.md`; return unsupported/capacity-changing proposals for architecture approval
+
+Dependency: T064 -> T101 -> updated speckit-plan/tasks + speckit-analyze gate ->
+T095/T073/T074/T097. Existing phase ordering does not bypass this gate. T101 is not
+complete until the actual policy is proven or a blocking limitation is reported.
+The additional task supports FR-006/027/029 and constitution I/V. U9 remains open;
+37 existing v2 tasks stay pending and T101 adds one pending task. No agent is authorized
+to silently relax independence or skip records to make tests pass.
+
+T101 progress (2026-11-23): negative-control Maven/JUnit probe prepared; execution
+blocked by missing local Java/Maven and Docker Hub connection refusal (exit 125).
+No build or integration test ran. See docs/finalizer-isolation-feasibility.md.
+T101 remains unchecked; U9 remains open and no supported isolation policy is proven.
+
+T101 update (2026-11-23): Docker environment unblocked. Negative control ran against
+Kafka: BUILD SUCCESS, 1 test passed; five-second shared-thread block prevented healthy
+partition output/offset progress, and both values arrived after release. This is a
+confirmed rejected baseline, not a successful isolation policy. Candidate isolation,
+heartbeats, actual errors and rebalance/takeover remain NOT RUN. T101 stays unchecked;
+see docs/finalizer-isolation-feasibility.md for evidence and limits.
+
+T101 update (2026-11-23, instrumented comparison): BUILD SUCCESS, 2 tests passed,
+0 skipped. With two verified distinct processing threads, the healthy input committed
+during a five-second block (input offsets 1/2); one shared thread stayed at 1/1.
+Neither case processed the blocked input's follower early. After release each expected
+record appeared exactly once within the observation window; offsets reached 3/2.
+Runtime task/thread logs and evidence are in reports/isolation-two-threads.log;
+shared findings/limits are in docs/finalizer-isolation-feasibility.md. Actual faults,
+heartbeat continuity, rebalance/takeover and abort isolation remain NOT RUN.
+This is steady-state candidate evidence only; T101 unchecked, U9 open.
