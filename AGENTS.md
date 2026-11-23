@@ -2,4 +2,8 @@
 For structural codebase exploration, use the installed `codebase-memory` skill.
 <!-- codebase-memory-mcp:end -->
 
-Before running Spec Kit or editing its artifacts, read and follow `.specify/AGENT_RULES.md`.
+Before every project stage, read and follow `.specify/AGENT_RULES.md` for Spec Kit workflow selection, agent-independent changes and stage approval.
+
+## Stage completion and approval
+
+The shared stage completion and approval rule in `.specify/AGENT_RULES.md` applies.
