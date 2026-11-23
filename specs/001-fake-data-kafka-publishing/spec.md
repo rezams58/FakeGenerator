@@ -273,3 +273,146 @@ ordering or ownership rules.
   count; message contract changes other than the approved lifecycle events; deleting dead-letter records;
   changing existing consumers without a compatibility review.
 - Primary users are developers, testers and load-test engineers; no end-user UI is required.
+
+## Approved v2 amendment — 2026-11-22 (authoritative for new work)
+
+Earlier sections describe v1 ingress behavior. Where they conflict, this amendment
+and contracts/final-topic-v2.md govern the approved final-topic pipeline.
+Implementation is pending. Design: ../../docs/exactly-once-final-topic-design.md.
+
+### US5 — Certify exact event equality (P1)
+As an operator I require all generated events, including those not marked published,
+to match the final topic exactly. Independent test: reject a same-count stream with
+one missing event and one extra event, and reject duplicates/malformed records.
+
+### US6 — Publish unique final events (P1)
+As a consumer I receive one committed final record per generated EventId, even if
+SQL-to-ingress replays. Independent test: replay an ingress batch after commit and
+restart the processor; final identities, payloads and order remain exact.
+
+### US7 — Recover and migrate safely (P1)
+As an operator I retain correctness through process failure, rebalance and state
+restore. Independent test: deterministic failures at transaction boundaries followed
+by full reconciliation; incompatible topology/state reset refuses startup.
+
+- FR-025: Closed runs MUST satisfy GeneratedEvents=FinalRecordsRead=FinalUniqueEvents.
+- FR-026: Missing, unexpected, duplicate, malformed, payload mismatch, pending and
+  dead-letter counts MUST all be zero for strict pass; verification must be complete.
+- FR-027: Recording an event as delivered and making its final output visible MUST
+  be one indivisible outcome. Recovery MUST neither lose an event nor expose it twice.
+  Replayed identities MUST retain their original content and routing.
+- FR-028: RunId MUST persist across generator restart; new runs get new identities.
+  Immutable EventId and RunId headers MUST survive ingress and final publication.
+- FR-029: Six fixed ingress/final partitions and original key/partition/order MUST
+  be preserved. Duplicate identity with conflicting payload MUST stop the partition.
+- FR-030: Dedup state and data retention MUST cover replay/verification horizons;
+  incompatible reset, routing changes and incomplete verification cannot pass.
+- FR-031: The stored Published flag means ingress acknowledgement only. Reports MUST separately
+  measure final records and compare all generated IDs and payloads bidirectionally.
+- SC-011: A closed 500000-event run has exactly 500000 committed final records and
+  identities, with all FR-026 errors zero, including deterministic crash scenarios.
+- SC-012: Restore/rebalance/fencing tests preserve equality, order and lifecycle.
+- SC-013: For a single abrupt termination of either an ingress publisher or a final
+  processor, with another eligible instance already running and backlog on every
+  affected partition, final delivery MUST resume on every affected partition within
+  18 seconds. Measure from acknowledged process termination to the first newly visible
+  committed event on each affected partition; the maximum interval determines pass.
+  Record observation uncertainty; an upper bound above 18 seconds cannot certify pass.
+  Dependency outages are measured separately and must preserve correctness after recovery.
+
+Dead-letter continuation remains ingress behavior; strict final acceptance fails
+until every generated event is repaired and delivered in valid order. Repair that
+would violate final ordering requires rebuilding a fresh versioned final pipeline.
+Equality applies after draining, before retention expiry, with read_committed;
+physical offsets and ingress record counts are not final business-message counts.
+
+### Specification refinements — 2026-11-22
+
+These requirements resolve behavioral questions from analysis U1–U6 and I2.
+Technical mechanisms and task ordering remain planning work; no implementation
+success is implied. Existing FR/SC identifiers and v1 history are preserved.
+
+#### User scenarios and acceptance
+
+**US5 acceptance**: Given two completed runs sharing a destination, verification
+of run B counts only B's events and reports run A's recognized events separately.
+Unknown run identities and malformed records in the audited destination fail the
+audit. Given equal raw counts but one missing and one extra B event, verification
+fails. Changing content under an existing identity also fails.
+
+**US6 acceptance**: Given identical repeated events, including after restart, only
+one final event is visible. Given the same identity with changed content, key or
+partition, publication is rejected and the run fails; it is never silently accepted
+as a different event. The check applies even when the attempted partition changes.
+
+**US7 acceptance**: Given a crash after the last generated event but before run
+closure, restart closes the existing run without adding events. Given a closed run,
+restart alone does not start another run; an explicit new-run request creates a new
+identity and generates its requested count independently of older stored events.
+Given missing delivery history or changed pipeline identity with existing output,
+startup fails before new output is emitted. A deliberate rebuild uses a fresh output
+history and is approved separately.
+
+#### Additional functional requirements
+
+- **FR-032**: Verification MUST select an explicit RunId and an immutable closed-run
+  manifest of every generated event, including unpublished and dead-lettered events.
+  Capture a fixed end boundary for every destination partition and audit all retained
+  business records from the run's registered audit start through those boundaries.
+  Recognized other-run events are reported separately and excluded from selected-run
+  counts; unknown run identities, invalid identities and malformed records fail audit.
+  Boundaries MUST cover the run's entire output history; expired required history or
+  an unclosed run makes verification incomplete, never successful.
+- **FR-033**: Each run MUST persist its identity, target, generated count and status.
+  At most one run may actively generate. Entity changes, event creation and progress
+  MUST agree after any restart. Closure requires exactly the target count and freezes
+  identity/content/routing, while delivery-status updates remain allowed. Target
+  counts apply per run, and existing legacy data requires an explicit legacy identity.
+- **FR-034**: The system MUST retain a durable binding between pipeline identity,
+  destination history, routing version and duplicate-detection history. Missing or
+  mismatched history MUST prevent publication. A new identity MUST NOT bypass this
+  check against an existing destination.
+- **FR-035**: Content comparison MUST follow one versioned equivalence contract across
+  all components. Object-member order is irrelevant; array order and string contents
+  are significant. Equivalent numeric values compare equal without loss of decimal
+  precision. Duplicate object-member names and unsupported numeric values are invalid.
+  Changing the comparison version requires compatibility validation before publication.
+- **FR-036**: Each EventId MUST retain one RunId, content, key, sequence and partition
+  across all retries. Routing validation MUST reject inconsistent copies before final
+  output, including copies sent to a different partition. Per-partition deduplication
+  alone is insufficient evidence of compliance.
+- **FR-037**: Performance baselines MUST identify delivery-contract version, pipeline
+  configuration and environment. A v1 ingress baseline MUST NOT be compared with v2
+  final delivery. Only a fully successful strict run may establish a v2 baseline.
+
+#### Key entities
+
+- Generation Run: stable identity, requested target, progress and active/closed state.
+- Closed Manifest: immutable identities, content and routing of all events in a run.
+- Audit Scope: selected run, registered start boundaries, captured end boundaries,
+  retained-history availability and recognized run identities for the destination.
+- Pipeline Identity: durable association of output history, routing, comparison
+  version and duplicate-detection history, retained across restarts.
+
+#### Measurable outcomes
+
+- **SC-014**: Two consecutive runs in one nonempty environment each produce exactly
+  their own requested count; auditing either run reports zero missing/duplicate/extra
+  events and excludes the other recognized run from that run's count.
+- **SC-015**: All tested interruptions at event-write, progress and closure boundaries
+  preserve the run identity and exact target; restart creates zero unintended runs.
+- **SC-016**: Every tested missing-history, identity-reset or changed-routing attempt
+  is rejected before it adds final output; all content-equivalence fixtures agree
+  across components, including precision and Unicode cases.
+
+#### Assumptions and scope
+
+- Multiple historical runs may share a destination; only one generator is active.
+  Explicit run selection and durable run registration are required for that use.
+- A valid recognized event from another run is not an unexpected event of this run;
+  unknown or malformed destination data prevents certifying the audit as trustworthy.
+- Required history is retained through reconciliation. Permanent storage loss and
+  deliberate expiration are detected limitations, not successful no-loss outcomes.
+- The approved Kafka Streams architecture remains a constraint in the constitution
+  and plan. Algorithms, versions, deployment commands and implementation dependencies
+  belong to planning, not to these behavioral acceptance criteria.

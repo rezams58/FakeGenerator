@@ -51,3 +51,9 @@ Steps for each record:
 
 `duplicates`, `orderingViolations`, `lifecycleViolations`, `deadLetterGaps`, `missingOnStream`
 (SQL published minus the distinct `event-id`s consumed).
+
+## v2 applicability
+The rules above describe at-least-once ingress and external SQL business effects.
+For the approved final topic, final-topic-v2.md governs: duplicates fail acceptance.
+Inbox still protects external effects against consumer reprocessing, but it is not
+used to justify duplicate final Kafka records.
