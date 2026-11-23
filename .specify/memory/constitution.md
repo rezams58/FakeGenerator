@@ -40,8 +40,11 @@ Rationale: a SQL fencing token cannot stop a zombie Kafka producer; only Kafka t
 - Failed-event detection across concurrent deliveries (for example `Task.WhenAll`) MUST map errors
   to the correct event.
 - Error details sufficient for later investigation MUST be persisted.
-- The system is At-Least-Once. No code, document or report MAY claim Exactly-Once between SQL
-  Server and Kafka.
+- SQL-to-ingress delivery is At-Least-Once; no atomic SQL/Kafka commit may be claimed.
+  The approved v2 final-topic pipeline MUST deduplicate EventId durably with Kafka Streams
+  exactly_once_v2, committing state, final output and input offsets atomically.
+  Exactly-once claims apply only to committed final business records within documented
+  routing, retention and recovery boundaries, excluding ingress and physical log offsets.
 - The consumer contract MUST stay documented: `IsolationLevel.ReadCommitted`, `EventId` from the
   header, an Inbox table with a unique constraint on `EventId`, and the Inbox insert plus the business
   operation in one SQL transaction.
@@ -126,4 +129,19 @@ Rationale: unverified claims are the main risk when agents implement concurrency
   any deviation MUST be justified in the plan's complexity tracking.
 - `docs/spec.md` is the runtime guidance for feature-level requirements.
 
-**Version**: 1.0.0 | **Ratified**: 2026-11-15 | **Last Amended**: 2026-11-15
+## Sync Impact Report — 2026-11-22
+
+User approved v2 architecture and specification changes. Principle III is redefined:
+ingress remains at-least-once; final-topic committed events must be unique and complete.
+Strict acceptance fails on duplicates, missing/foreign/malformed events, payload mismatch,
+pending or dead letters. Inbox remains required for atomic external business effects.
+Approved scope exceptions: Kafka Streams JVM service, RunId message extension and
+versioned-topic consumer migration. SQL leases govern ingress; Streams group ownership
+and transactional fencing govern final processing. Strict topology requires exactly six
+partitions at ingress and final, overriding the v1 minimum-count rule for this pipeline.
+The amendment does not approve automatic partition changes or multi-generator support.
+Spec, plan, contracts and tasks carry the v2 amendment. Completed v1 tasks and evidence
+remain historical. Implementation and rollout are pending; templates need no structural
+change. docs/spec.md points to the authoritative amendment.
+
+**Version**: 2.0.0 | **Ratified**: 2026-11-15 | **Last Amended**: 2026-11-22

@@ -359,3 +359,8 @@ Consumer باید:
 6. ZIP نهایی را فقط پس از اعتبارسنجی فایل‌ها ارائه کن.
 
 **قانون نهایی:** هیچ‌گاه موفقیت Build، تست، Performance یا Production Readiness را بدون شواهد اجرای واقعی اعلام نکن.
+
+## Approved v2 authority
+For new final-topic work, specs/001-fake-data-kafka-publishing/spec.md (v2 amendment)
+and contracts/final-topic-v2.md supersede this document's v1 duplicate acceptance.
+The Kafka Streams architecture is approved; implementation is pending.
