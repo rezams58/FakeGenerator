@@ -265,3 +265,79 @@ The aborted first transaction is invisible to `read_committed` consumers.
   - This would remap keys and break per-key ordering across runs.
   - **Decision**: document it as an operational constraint in the README and quickstart. Automatic
     repartitioning stays out of scope.
+
+## v2 research decisions — 2026-11-22
+
+This section supersedes v1 delivery/baseline assumptions above. Detailed normative
+choices are in contracts/v2-processing.md. Research performed directly in this
+session; no subagents were requested or launched.
+
+- R10 Decision: Kafka Streams EOS v2, Java 17 baseline, Streams 4.1.2 design target,
+  classic consumer-group protocol. Rationale: transactional state/output/offsets with
+  documented EOS-v2 upgrade support. Alternative: custom .NET receipts requires an
+  additional recovery proof. Deployment remains gated on actual broker API and topic-ID
+  compatibility; unsupported environments fail preflight, not silent client downgrade.
+  Pin the build and verify the integration profile during T064; no broker upgrade here.
+- R11 Decision: immutable SQL event catalog read by finalizer before forwarding.
+  Rationale: local dedup alone cannot detect a copied ID under another key/partition.
+  Alternative: repartition-by-ID changes original partition ordering. Cost: SQL read
+  availability and throughput; batch immutable lookups, never mark delivery from Java.
+- R12 Decision: SQL registry bound to cluster and topic UUIDs, restrictive runtime ACLs,
+  precreated internal topics, restore/output audit before processing each assigned task.
+  Rationale: application.id changes otherwise create fresh state against old output.
+  Alternative: name checks alone miss recreated topics. Cost: recovery scans can miss
+  18 seconds; the acceptance gate remains binding and requires measurement/redesign if failed.
+- R13 Decision: decimal-json-v1 typed canonical grammar with exact decimal tokens.
+  Rationale: binary-double canonicalization cannot preserve all monetary/large decimal
+  values. Alternative: raw bytes misclassify object-order/numeric-format equivalents.
+  Cross-language fixtures are mandatory before either implementation.
+- R14 Decision: global pipeline audit starts, explicit selected RunId, classify known
+  other runs separately. Rationale: retained prior runs must not produce false extras;
+  unknown/malformed records still invalidate the audit. Cost: full-history scanning.
+- R15 Decision: atomic run progress/closure and explicit new-run operation, fresh entity
+  pool per run. Rationale: restart must not invent a new run or reuse the database-wide
+  target count. Legacy data gets explicit registration, never silent reassignment.
+- R16 Decision: v2-only final-observer performance baselines and deterministic recovery
+  measurement; ingress SQL timing is a separate metric. Old baselines remain historical.
+
+Primary sources checked in planning:
+https://kafka.apache.org/41/streams/upgrade-guide/ — EOS-v2 and upgrade compatibility.
+https://kafka.apache.org/documentation/streams/developer-guide/running-app/ — restore lifecycle.
+https://kafka.apache.org/39/streams/developer-guide/config-streams/ — application configuration.
+https://kafka.apache.org/design/ — transaction/read_committed boundaries.
+These sources support the Kafka primitives; catalog/registry/canonicalization decisions
+are project-specific design choices, not Kafka-provided guarantees.
+
+### R17 — U7 assignment-scoped audit ordering
+Decision: bind audit to a cancellable task-assignment token and enforce the ordered
+readiness/boundary/gate checks in contracts/v2-processing.md through supported Streams
+lifecycle integration. Rationale: restore completion alone does not prove old-owner
+transactions and final output are a stable comparison snapshot. Alternative rejected:
+using RUNNING as a fence or creating another producer with Streams transactional IDs.
+The local token guards stale callbacks; Kafka retains transactional fencing authority.
+Lifecycle feasibility is an explicit T096 test gate, not an assumed API capability.
+Sources: https://kafka.apache.org/41/streams/developer-guide/running-app/ (restore before
+processing); https://kafka.apache.org/41/streams/architecture/ (task migration/state);
+https://kafka.apache.org/41/configuration/kafka-streams-configs/ (EOS-v2 settings).
+The audit protocol is a project design on top of these primitives, not a Kafka API promise.
+
+### R18 — U8 drain evidence
+Decision: quiesce ingress with a persistent epoch barrier and use broker-committed
+finalizer offsets through the captured committed-business input cut before final audit.
+Rationale: SQL marks prove only ingress acknowledgement; local consumer positions may
+advance before transactions commit. Transaction markers can make raw high-watermark
+comparison unsuitable for the group offset. Alternatives rejected: pending=0, fixed
+sleep or local lag as success. Cost: explicit pipeline-wide audit pause and coordinator
+recovery operation. Failure remains incomplete, not a relaxed acceptance criterion.
+
+### R19 — U9 supported error handling limitation
+Decision: do not select a handler-only retry strategy; keep isolation as an explicit
+feasibility gate. Kafka 4.1 processing.exception.handler has FAIL/CONTINUE; production
+RETRY applies to retriable production errors. Neither proves independent SQL/catalog
+retry under shared tasks/transactions. Alternatives requiring deployment changes are
+not yet approved. The candidate TaskAssignor API needs assignment-granularity proof.
+Sources checked 2026-11-23:
+https://kafka.apache.org/41/streams/developer-guide/config-streams/
+https://kafka.apache.org/41/configuration/kafka-streams-configs/
+The incompatibility with this project's local no-loss retry requirement is our design
+assessment; no runtime prototype or test was executed in this documentation stage.

@@ -107,3 +107,77 @@ SELECT PartitionId, OwnerId, LeaseUntilUtc, FencingToken FROM dbo.PublisherParti
 | Invalid lifecycle config (e.g. a cycle Paid→Created) | The generator refuses to start, and the Outbox row count is unchanged |
 
 Record every check that was not executed as **not run**, with the reason (Constitution VI).
+
+## v2 acceptance scenarios
+Use fresh isolated SQL and six-partition ingress/final topics. Validate fingerprint
+fixtures and strict verifier first; then run finalizer integration and deterministic
+failure scenarios listed in tasks T064–T084. Close the run, drain both stages, and
+verify exactly 500000 committed final records/IDs, with all strict errors zero.
+No runnable finalizer command is claimed until its build/configuration tasks finish.
+
+## v2 planned validation runbook (Phase 1)
+
+The following commands are the implementation acceptance interface, not commands
+claimed runnable today. Do not run until the corresponding tasks create the service,
+migrations and CLI. Use disposable resources and process-local credentials.
+Prerequisites: .NET8, Java17, Maven, supported Kafka with topic UUIDs/transactions,
+SQL test catalog, six-partition fresh ingress/final topics, retention covering all
+history, and provisioner/runtime/verifier roles as contracts/v2-processing.md specifies.
+Provisioning must register exact topic IDs/internal topics and boundaries before input.
+
+```powershell
+# Build and fixtures/integration tests after implementation
+ dotnet test tests/FakeGenerator.Tests -c Release
+ mvn -f services/finalizer/pom.xml verify
+# Planned service preflight and process (use a separate terminal per process)
+ java -jar services/finalizer/target/finalizer.jar --config local-finalizer.properties --check-only
+ java -jar services/finalizer/target/finalizer.jar --config local-finalizer.properties
+# UUID comes from explicit pipeline registration; save returned run UUID
+ dotnet run --project src -c Release -- --new-run --target-events 500000 --pipeline-id <pipeline-uuid>
+ dotnet run --project src -c Release -- --verify --run-id <returned-run-uuid>
+```
+
+Do not place secrets in arguments or tracked properties. Missing SQL/Kafka/JVM tests
+are explicitly not run, not passed. Package must set finalizer.jar as its artifact name.
+
+Validation order:
+1. Compare canonical fixtures in C#/Java, including decimal precision and invalid input.
+2. Migrate fresh/legacy databases twice; interrupt final generation transaction and
+   resume the same RunId. New run in nonempty DB generates its own target only.
+3. Inject duplicate/conflicting/wrong-partition ingress; ensure no invalid final forward.
+4. Fault injection at ingress commit/SQL mark and finalizer commit boundaries, then
+   rebalance and erase local state with intact changelog; verify restoration.
+5. On separate disposable pipelines, test changed application.id, deleted/recreated
+   internal topics and unavailable registry/catalog; fail before new output.
+6. Drain and verify 500000 exact final events, zero strict errors. Repeat another run
+   and audit each explicitly; classify known other-run records separately.
+7. Recovery controller uses monotonic termination-to-final-observation bounds on all
+   affected partitions. >18 seconds fails. Persist real logs/counts and versioned
+   final-throughput baseline only on strict pass. Consumer cutover requires approval.
+
+Until these checks execute, no v2 throughput, recovery or exactly-once runtime success
+is claimed. Next workflow is speckit-tasks followed by speckit-analyze.
+
+### I3 ordered migration validation
+After 01-schema.sql, 03-multinstance-publisher.sql and 04-lifecycle.sql, the planned
+v2 order is 05-pipeline-registration.sql -> 06-generation-runs.sql ->
+07-verification-snapshots.sql. Repeat on clean and legacy fixtures; require idempotency
+and rejection of a GenerationRun with an unknown PipelineId. These scripts are pending
+implementation; this documentation change does not claim database execution.
+
+### U7 recovery validation
+Before T097, prove supported lifecycle integration using T096. Inject old-owner commit
+and abort while takeover starts; rebalance during restore, boundary capture, scan and
+gate-open; release stale audit callbacks after reassignment. Require no forwarding
+before the current token validates and no committed stale-owner output. Record H/C,
+topic IDs, transition times and assignment token; timeouts are incomplete/failed
+recovery, never successful audits. U8/U9/C1 are not resolved by this scenario.
+
+### U8 verification completion checks
+With selected run closed and SQL pending zero, deliberately hold the finalizer behind:
+verification must wait. Advance only its broker-committed offsets/output atomically,
+then verify strict equality. Include control-only/aborted tails, unresolved transactions,
+coordinator/ingress crash and cancellation. The barrier remains held after coordinator
+crash until explicit recover/release. Record epoch and H/B/F vectors; timeout defaults
+to 600 seconds for the whole attempt and exits 3 with no baseline. Do not confuse it
+with 18-second recovery acceptance. These are planned tests, not executed results.

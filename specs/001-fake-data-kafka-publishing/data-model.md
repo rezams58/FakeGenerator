@@ -125,3 +125,56 @@ Rules:
   do not write it themselves. The generator logs its own counts when it stops.
 - Every count comes from a real query or from a real consumer.
 - When the verifier was not run, its fields are `null` and the report marks them **not run**.
+
+## v2 data model amendment
+Persist GenerationRun(RunId UUID primary key, TargetEventCount positive integer,
+State Active|Closed, CreatedAtUtc, ClosedAtUtc nullable only while Active).
+Outbox.RunId references GenerationRun; immutable EventId/partition/key/sequence/payload
+form the closed manifest. Existing data must be explicitly assigned a legacy run
+without changing EventIds; a nonempty database is never silently treated as a new run.
+Kafka dedup state is partition-local (RunId, EventId) -> immutable fingerprint.
+See contracts/final-topic-v2.md for report fields and invariants. SQL Published remains
+an ingress acknowledgement, not a final-topic count.
+
+## v2 Phase 1 model details (current)
+
+- GenerationRun: RunId UUID PK; PipelineId FK; TargetEventCount bigint >0;
+  GeneratedCount bigint between 0 and target; State Active|Closed; CreatedAtUtc;
+  ClosedAtUtc required iff Closed. Unique filtered index permits one Active row.
+  Final batch updates entities/events/count/Closed atomically; restart reconciles legacy
+  active-at-target state. Closed rows cannot change target, identity or manifest.
+- Outbox: global EventId PK and SequenceNo uniqueness retained; nonnullable RunId FK;
+  canonical version and hash; payload/routing/type immutable from creation. SQL role
+  restricts writes to procedures; publisher may update delivery fields only.
+- PipelineRegistration: PipelineId PK; unique ClusterId+FinalTopicId; ApplicationId,
+  ingress/final/internal topic UUIDs; topology/routing/hash versions; config fingerprint;
+  Provisioning|Ready|Suspended|Retired. Ready requires empty bootstrap validation.
+- PipelineAuditBoundary: PipelineId+Partition PK; RegisteredStartOffset bigint >=0;
+  TopicId; Partition in 0..5. Retained for every run; low watermark crossing it is an error.
+- VerificationSnapshot: VerificationId PK, RunId FK, manifest digest, six start/end
+  offsets, captured time, completion, selected/other/invalid counts and strict failures.
+  No end-to-end pass unless all six captured ends are reached and sets/hashes agree.
+- DedupStore: partition-local (RunId,EventId) -> immutable metadata/hash/version, logged
+  transactionally. Catalog validates global EventId identity before store lookup/forward.
+
+Canonical grammar, transitions and restore/reset guard: contracts/v2-processing.md.
+Migration must backfill legacy RunId explicitly, preserve EventIds, validate counts and
+be repeatable; uncertain legacy scope blocks migration rather than guessing membership.
+
+### I3 migration order — 2026-11-23
+Create PipelineRegistration and PipelineAuditBoundary in 05-pipeline-registration.sql
+before GenerationRun and its PipelineId FK in 06-generation-runs.sql. Registry schema
+has no dependency on GenerationRun; runtime provisioning is separate. Then apply
+07-verification-snapshots.sql, which references GenerationRun. Run this sequence twice
+on clean/legacy test databases and assert the FK rejects an unregistered PipelineId.
+
+### U8 audit evidence and coordination
+PipelineVerificationBarrier: PipelineId unique active barrier, Epoch bigint monotonic,
+VerificationId UUID, OwnerId UUID, State Requested|Held|Released, requested/released
+UTC timestamps. VerificationLaneAck: (PipelineId,Epoch,Partition) PK, ingress owner
+and fencing token, acknowledged timestamp; acknowledgement means transaction/mark resolved.
+The registry migration creates these tables before runtime use; unknown PipelineId fails.
+VerificationSnapshot adds barrier epoch, ingress/final topic UUIDs, H[6], B[6] (nullable
+for no business records), finalizer group ID and observed committed offsets, F[6],
+manifest digest, stage, timeout configuration and blocked partition/reason. Empty business
+partitions are distinct from unknown offsets. Failed/incomplete attempts remain evidence.
