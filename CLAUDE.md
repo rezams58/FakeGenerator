@@ -1,3 +1,3 @@
 # Spec Kit
 
-Before running Spec Kit or editing its artifacts, read and follow `.specify/AGENT_RULES.md`.
+Before every project stage, read and follow `.specify/AGENT_RULES.md` for Spec Kit workflow selection, agent-independent changes and stage approval.
