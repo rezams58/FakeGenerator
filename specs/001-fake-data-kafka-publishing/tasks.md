@@ -345,3 +345,13 @@ Runtime task/thread logs and evidence are in reports/isolation-two-threads.log;
 shared findings/limits are in docs/finalizer-isolation-feasibility.md. Actual faults,
 heartbeat continuity, rebalance/takeover and abort isolation remain NOT RUN.
 This is steady-state candidate evidence only; T101 unchecked, U9 open.
+
+T101 update (2026-11-23, injected validation failure/replacement): initial run 3 tests,
+1 takeover timeout failure; explicit test session timeout 10s/heartbeat 3s then rerun
+BUILD SUCCESS, 3 passed, 0 skipped, 54.48s. Failed offset stayed 1; SHUTDOWN_CLIENT
+also halted healthy progress. Replacement with same application.id replayed retained
+input; each expected value observed once and offsets reached 3/3. This rejects the
+client-shutdown isolation policy, not the no-loss requirement. Sequential rejoin is
+tested; live rebalance, SQL errors, heartbeat continuity and persistent-state recovery
+are NOT RUN. T064 pending; T101 unchecked/U9 OPEN. Evidence and limits:
+docs/finalizer-isolation-feasibility.md; local logs reports/isolation-failure-takeover*.log.

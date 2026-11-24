@@ -1,5 +1,8 @@
 # T101 feasibility status — 2026-11-23
 
+Latest result: validation-failure/client-restart probe added; final run 3 passed.
+SHUTDOWN_CLIENT preserves failed input but interrupts healthy processing. U9 OPEN.
+
 Status: INCOMPLETE. Negative control and steady-state two-thread candidate executed.
 Separate threads allowed healthy progress in this bounded experiment. Shared-thread
 independence failed as expected. U9 remains open and T101 unchecked.
@@ -105,3 +108,42 @@ once for the production SQL-to-final pipeline. T101 remains unchecked.
 Next proposed approved scope: extend T101 with fault injection and controlled
 rebalance/takeover, capturing healthy progress and failed-input offset invariants;
 route any required capacity/topology changes through speckit-plan and analysis.
+
+## Validation failure and replacement takeover — 2026-11-23
+
+The third test injects IllegalArgumentException at input partition 0 offset 1 after
+a bounded latch. The default processing FAIL path reaches the public uncaught
+exception handler, configured SHUTDOWN_CLIENT. This is a rejected isolation baseline,
+not an adopted retry policy. The injected condition clears once, modeling a repaired
+validation condition; permanent invalid records must not be accepted automatically.
+
+Observed before shutdown: healthy output committed while partition 0 waited; its
+follower did not execute. After the exception, partition 0 committed offset remained
+1. After client shutdown, a newly submitted healthy record made no progress during
+the two-second observation. Thus two threads plus SHUTDOWN_CLIENT fail independence.
+
+The first run failed its takeover assertion: 3 tests, 1 failure, 83.21 seconds.
+No replacement output arrived within 30 seconds; logs show replacement assignment
+only as the observation expired. Log: reports/isolation-failure-takeover.log.
+The experiment now explicitly sets consumer.session.timeout.ms=10000 and
+consumer.heartbeat.interval.ms=3000 to bound departure detection within that window.
+This is a test profile, not a production timeout recommendation or heartbeat proof.
+
+Final rerun: BUILD SUCCESS, exit 0; 3 tests, 0 failures/errors/skipped, 54.48 seconds.
+Log: reports/isolation-failure-takeover-retry.log. Replacement KafkaStreams client,
+same application.id, new client identity, received reassigned tasks after shutdown.
+Each blocked/follower/healthy/healthy-after-failure value appeared once, including
+the additional two-second audit window; blocked preceded follower. Both broker-
+committed input offsets reached 3. The two prior baseline tests also passed.
+Cleanup completed normally. No production code/settings changed.
+
+Limits: this exercises sequential shutdown/rejoin and runtime-managed reassignment,
+not simultaneous live membership change, process kill, zombie fencing, persistent
+store restoration or recovery within the 18-second target. Actual SQL catalog faults,
+prolonged/repeated retries, measured heartbeat continuity and independent healthy
+commits through live rebalance remain NOT RUN. There is no persistent dedup store in
+this probe. It proves neither production deduplication nor a supported local retry
+policy. T064 remains pending; these exploratory results do not complete that dependency.
+T101 stays unchecked and U9 stays OPEN. Next: supported isolation policy design through
+speckit-plan, with explicit capacity/topology approval and tasks/analyze synchronization
+before further finalizer implementation.

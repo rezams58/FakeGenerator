@@ -10,17 +10,25 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler.StreamThreadExceptionResponse;
 import static org.junit.jupiter.api.Assertions.*;
 
 class IsolationTest {
  @Test void sharedThreadBlocksHealthyPartitionDuringLocalRetry() throws Exception { probe(1); }
  @Test void separateThreadsAllowHealthyPartitionDuringLocalRetry() throws Exception { probe(2); }
+ @Test void validationFailureShutsClientAndReplacementReplaysUncommittedInput() throws Exception { probe(2,true); }
 
  private void probe(int threads) throws Exception {
+  probe(threads,false);
+ }
+ private void probe(int threads,boolean injectFailure) throws Exception {
   String broker=System.getenv("FAKEGEN_TEST_KAFKA");
   assertNotNull(broker,"FAKEGEN_TEST_KAFKA required; integration test not optional");
   String id="fakegen-isolation-"+UUID.randomUUID(), input=id+"-in", output=id+"-out";
   var blocked=new CountDownLatch(1); var release=new CountDownLatch(1);
+  var failOnce=new AtomicBoolean(injectFailure);
+  var clientFailed=new CountDownLatch(1);
   Map<String,String> processingThreads=new ConcurrentHashMap<>();
   Properties props=new Properties(); props.put("bootstrap.servers",broker);
   try(Admin admin=Admin.create(props)) {
@@ -30,6 +38,8 @@ class IsolationTest {
     props.put("processing.guarantee","exactly_once_v2"); props.put("commit.interval.ms",100);
     props.put("default.key.serde",Serdes.StringSerde.class.getName()); props.put("default.value.serde",Serdes.StringSerde.class.getName());
     props.put("consumer.auto.offset.reset","earliest"); props.put("consumer.max.poll.interval.ms",60000);
+    // Keep failure detection inside the bounded takeover observation (30 seconds).
+    props.put("consumer.session.timeout.ms",10000); props.put("consumer.heartbeat.interval.ms",3000);
     StreamsBuilder builder=new StreamsBuilder();
     builder.<String,String>stream(input).peek((k,v)->{
      processingThreads.put(v,Thread.currentThread().getName());
@@ -37,11 +47,14 @@ class IsolationTest {
       blocked.countDown();
       try { if(!release.await(30,TimeUnit.SECONDS)) throw new IllegalStateException("probe release timeout"); }
       catch(InterruptedException e){Thread.currentThread().interrupt(); throw new RuntimeException(e);}
+      if(failOnce.compareAndSet(true,false)) throw new IllegalArgumentException("injected validation failure");
      }
     }).to(output);
     Properties pp=new Properties(); pp.put("bootstrap.servers",broker); pp.put("key.serializer",StringSerializer.class.getName()); pp.put("value.serializer",StringSerializer.class.getName()); pp.put("acks","all");
     Properties cp=new Properties(); cp.put("bootstrap.servers",broker); cp.put("group.id",id+"-audit"); cp.put("key.deserializer",StringDeserializer.class.getName()); cp.put("value.deserializer",StringDeserializer.class.getName()); cp.put("isolation.level","read_committed"); cp.put("enable.auto.commit",false); cp.put("auto.offset.reset","earliest");
-    try(KafkaStreams streams=new KafkaStreams(builder.build(),props); KafkaProducer<String,String> producer=new KafkaProducer<>(pp); KafkaConsumer<String,String> consumer=new KafkaConsumer<>(cp)) {
+    Topology topology=builder.build();
+    try(KafkaStreams streams=new KafkaStreams(topology,props); KafkaProducer<String,String> producer=new KafkaProducer<>(pp); KafkaConsumer<String,String> consumer=new KafkaConsumer<>(cp)) {
+     streams.setUncaughtExceptionHandler(error->{ clientFailed.countDown(); return StreamThreadExceptionResponse.SHUTDOWN_CLIENT; });
      try {
       consumer.assign(List.of(new TopicPartition(output,0),new TopicPartition(output,1))); consumer.seekToBeginning(consumer.assignment()); streams.start();
       producer.send(new ProducerRecord<>(input,0,"a","warm0")).get(30,TimeUnit.SECONDS);
@@ -64,6 +77,30 @@ class IsolationTest {
       assertFalse(processingThreads.containsKey("follower"),"follower overtook blocked record");
       System.out.println("EVIDENCE threads="+threads+" phase=blocked committed="+counts(observed)+" offsets="+offsets+" processingThreads="+processingThreads);
       release.countDown(); until=System.nanoTime()+TimeUnit.SECONDS.toNanos(30);
+      if(injectFailure) {
+       assertTrue(clientFailed.await(20,TimeUnit.SECONDS),"injected exception did not reach handler");
+       assertTrue(streams.close(Duration.ofSeconds(20)),"failed client did not close");
+       offsets=admin.listConsumerGroupOffsets(id).partitionsToOffsetAndMetadata().get(20,TimeUnit.SECONDS);
+       assertEquals(1L,offsets.get(new TopicPartition(input,0)).offset(),"failed record must remain uncommitted");
+       producer.send(new ProducerRecord<>(input,1,"b","healthy-after-failure")).get(30,TimeUnit.SECONDS);
+       long stoppedUntil=System.nanoTime()+TimeUnit.SECONDS.toNanos(2);
+       while(System.nanoTime()<stoppedUntil) collect(consumer,observed);
+       assertEquals(Map.of("healthy",1L),counts(observed),"client-wide shutdown must be visible as healthy-partition outage");
+       System.out.println("EVIDENCE validationFailure clientShutdown=true failedOffset=1 healthyProgressAfterShutdown=false");
+       try(KafkaStreams replacement=new KafkaStreams(topology,props)) {
+        replacement.start(); until=System.nanoTime()+TimeUnit.SECONDS.toNanos(30);
+        while(observed.size()<4 && System.nanoTime()<until) collect(consumer,observed);
+        long auditUntil=System.nanoTime()+TimeUnit.SECONDS.toNanos(2);
+        while(System.nanoTime()<auditUntil) collect(consumer,observed);
+        assertEquals(Map.of("blocked",1L,"follower",1L,"healthy",1L,"healthy-after-failure",1L),counts(observed));
+        assertTrue(observed.indexOf("blocked")<observed.indexOf("follower"));
+        offsets=admin.listConsumerGroupOffsets(id).partitionsToOffsetAndMetadata().get(20,TimeUnit.SECONDS);
+        assertEquals(3L,offsets.get(new TopicPartition(input,0)).offset());
+        assertEquals(3L,offsets.get(new TopicPartition(input,1)).offset());
+        System.out.println("EVIDENCE replacementTakeover=true exactCounts="+counts(observed)+" offsets="+offsets);
+       }
+       return;
+      }
       while(observed.size()<3 && System.nanoTime()<until) collect(consumer,observed);
       // Continue reading after all expected records to detect additional committed copies.
       until=System.nanoTime()+TimeUnit.SECONDS.toNanos(2);
